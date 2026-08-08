@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/aaron/Developer/vivaldi-tools/vivaldi-workspace-helper -type f -not -path '*/node_modules/*' | sort *)",
+      "Read(//Users/aaron/Applications/Vivaldi Debug.app/**)"
+    ]
+  }
+}
