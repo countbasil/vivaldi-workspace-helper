@@ -38,3 +38,248 @@ approach" section before changing the bridge script or wrapper app — the
 constraints there (no workspace-assignment API, module IDs unstable across
 builds, the AppleScript-applet default-browser limitation) came from
 extensive empirical testing, not assumptions.
+
+## Second feature: toast + jump for auto-routed background tabs
+
+Separate from the CDP-based jump feature above, and **deliberately not
+built the same way** — see the planning doc's 2026-08-08 section for the
+full rationale. Detects when Vivaldi's "open websites in workspaces
+automatically" rule (Settings → workspace rules) routes an incoming URL into
+a window that isn't currently focused, and shows a toast naming the
+destination workspace/tab, with click-to-jump, an in-toast keyboard
+shortcut, and an external-hotkey fallback.
+
+This is split across **two** injection points, because the document that can
+detect the route (`main.html`) isn't the document that can draw anything
+on screen (`window.html`, one instance per open window):
+
+- `injected/workspace-route-watcher.js` — plain JS injected into `main.html`
+  via `injected/install.sh`, following the same technique as the sibling
+  `vivaldi-theme-switcher` project's `custom.js`. Runs inside Vivaldi's own
+  process for the lifetime of the browser; does the detection and
+  workspace-name resolution — no CDP involved at all for this feature. Three
+  detection paths, each covering a different way Vivaldi actually delivers a
+  routed tab (confirmed by watching real events live over CDP, not assumed):
+  `chrome.tabs.onCreated` (URL opened from another app, or pasted into the
+  address bar, lands directly in the destination window), `chrome.tabs.onAttached`
+  (cmd+click instead opens the tab in the *current* window first, and
+  Vivaldi's rule engine moves it to the destination window a moment later —
+  a cross-window move fires `onAttached`, not another `onCreated`), and
+  `chrome.tabs.onUpdated` gated on `changeInfo.vivExtData` (when the target
+  workspace has **no window at all**, Vivaldi doesn't move the tab anywhere
+  to wait for — it just tags the tab in place, still sitting wherever it was
+  created, via a `vivExtData` update moments after creation; neither of the
+  other two listeners ever fires for this case since the tab never actually
+  changes windows). Since it has no viewport, it can't show anything itself
+  — it broadcasts a `vwh-show-toast` runtime message instead. Workspace name
+  (and its emoji, for the toast icon) is resolved from the *tab's own*
+  `vivExtData.workspaceId` (present on every `chrome.tabs.Tab`), not from
+  `workspaceStore.getActiveWorkspaces()` (which only says what a *window* is
+  currently displaying) — a tab can belong to a workspace with no window of
+  its own at all, parked hidden inside some other window's tab strip, and
+  those two things disagree exactly in that case. "Is this really a
+  background tab" (for the onCreated/onAttached paths) is decided by a fresh
+  `chrome.windows.getLastFocused()` query after a short
+  (`BACKGROUND_CHECK_DELAY_MS`) settle delay, rather than a self-maintained
+  cache of the last focus event — the cache had a real race (a brand-new
+  window's own initial tab, e.g. Cmd+N, could be misjudged as background if
+  its own focus event hadn't been processed yet by the time its tab's
+  `onCreated` fired).
+
+  A fourth, distinct case: an **externally-opened** URL (see below for how
+  that's recognized) routed to a workspace with no window doesn't get a new
+  window from Vivaldi itself — confirmed live, Vivaldi instead reassigns the
+  *current foreground window's* displayed workspace in place and loads the
+  tab there. This is invisible to all three paths above (the tab's own
+  workspace and its window's displayed workspace already agree by the time
+  any of them would check), so it needs its own signal:
+  `workspaceStore.addListener` (the same subscription mechanism
+  `vivaldi-theme-switcher` uses, but never previously used in this project),
+  watching for the *focused* window's displayed workspace changing,
+  correlated against a tab created with `active: true` in that same window
+  within the last `FOREGROUND_TAB_CORRELATION_MS` — without that
+  correlation this would also fire for the user's own manual workspace
+  switches, which aren't routed tabs and shouldn't get a route-related
+  toast. This case gets different wording entirely ("Vivaldi changed window
+  to `<emoji>` `<name>`", click just dismisses — the window is already what's
+  on screen, there's nothing to jump to), and there's a real race against
+  the third (`onUpdated`/`vivExtData`) path worth knowing about: that path
+  fires the moment the tab is tagged, which can be *before* Vivaldi finishes
+  the in-place switch, making the workspace look temporarily windowless —
+  fixed by having it skip firing only when the tab is *both* sitting in the
+  currently-focused window *and* is the specific `active:true` tab
+  `onWorkspaceStoreChanged`'s own correlation is tracking there (checked via
+  `recentActiveTabWindows`), deferring to this fourth path only for that
+  exact case. A broader "skip whenever sitting in the focused window"
+  version of this check was tried first and was a real regression: a
+  background (`active:false`) cmd+click tab routed to a windowless workspace
+  *also* never leaves the focused window (same mechanism, different
+  origin), so it hit that skip too and then had no path left to notify
+  through at all — a silent, total drop, confirmed live after closing a
+  window this feature had created and cmd+clicking back to that same
+  now-windowless workspace.
+
+  A fifth case, layered on top of the first three rather than a separate
+  detection path: an externally-opened tab that lands in an *existing*
+  different window (not windowless) doesn't get raised to the front by
+  Vivaldi either — confirmed live, it just sits there unfocused, same as a
+  cmd+click route would. `handleBackgroundTab` raises that window itself and
+  shows "Raised window with `<emoji>` `<name>`" (click dismisses, nothing to
+  jump to) instead of the click-to-jump toast, whenever the tab was
+  originally foreground-intent. "Externally opened"/foreground-intent is
+  recognized by `tab.active === true` **at creation time specifically** —
+  confirmed live (both a synthetic `chrome.tabs.move` and a genuine external
+  open) that Vivaldi resets a tab's `active` flag to `false` the instant it
+  lands via a cross-window move, regardless of how it started, so checking
+  `active` on the settled tab (after the move) always reads `false` and
+  can't distinguish anything. `tabOriginalActiveState` (tabId → `active` at
+  `onCreated`, captured before any move can touch it) is the fix; `active`
+  read anywhere later is unreliable. This same signal is what distinguishes
+  cmd+click (`active: false`, always) from external opens, confirmed
+  empirically; address-bar entry doesn't even create a new tab (navigates
+  in place), so it never reaches any of this code at all.
+
+  **Bug found and fixed (2026-08-09)**: the fifth case's "raise" branch
+  assumed `routedTab.windowId` (whatever window the tab landed in) was
+  necessarily displaying `routedTab.workspaceId` (the tab's own workspace)
+  — true whenever Vivaldi actually routes the tab to a real window for that
+  workspace, but not always. Confirmed live: when the *frontmost* window has
+  no workspace binding of its own, and the target workspace also has no
+  window, Vivaldi doesn't do the fourth case's usual in-place reassignment
+  of the frontmost window — it drops the tab into some other, unrelated,
+  already-open window instead (tagging it with the target workspace via
+  `vivExtData` without ever making that window display it). Symptom: a
+  toast reading "Raised window with Devel" while the window actually raised
+  was displaying Work. Fix: `handleBackgroundTab` now confirms via
+  `findWindowDisplayingWorkspace` that the window it's about to raise
+  actually displays the claimed workspace before taking the raise branch;
+  otherwise it falls through to the normal click-to-jump toast, which
+  already resolves correctly once clicked (`jumpToTab` moves the tab if it
+  isn't already sitting in the target window).
+- `injected/window-toast.js` — plain JS injected into `window.html` (the
+  visible per-window chrome document; every open window loads its own
+  instance of the same file), also via `injected/install.sh`. Listens for
+  that broadcast and — only in the instance whose window id matches
+  `displayWindowId` (i.e. whichever window the user is actually looking at)
+  — renders the actual toast: a fixed-position div, positioned relative to
+  the actual web content viewport (`.webpageview`/`webview`'s own bounding
+  rect via `getContentViewportRect()`), not the window as a whole — a
+  window-relative position landed the toast partly *underneath* Vivaldi's
+  own toolbar/tab-strip chrome, which silently ate clicks on that portion
+  (confirmed live via `document.elementFromPoint` hit-testing at several
+  points across the toast). Background opacity is `TOAST_OPACITY` (a
+  constant at the top, currently `0.6`); auto-dismisses after
+  `TOAST_DURATION_MS` (also freely tweakable). Three `variant`s share this
+  renderer: `"route"` (default) is interactive — click or **⌥⌘J** sends a
+  `vwh-jump-request` back to `main.html`; `"foreground-switch"` and
+  `"raised-window"` are informational — click just dismisses, nothing to
+  jump to. ⌥⌘J itself (checked via `e.code`, not `e.key` — Option remaps
+  `e.key` to a dead-key character on macOS) is a **global** listener
+  attached once at init, not tied to a toast being visible — it used to be
+  toast-scoped, but `TOAST_DURATION_MS` is easy to miss if you don't react
+  immediately, and there was then no listener left by the time the shortcut
+  was actually pressed. It always asks `main.html` for whatever was most
+  recently routed (`vwh-jump-last-routed`, handled by `jumpToLastRoutedTab`)
+  rather than a specific toast's target, mirroring the relay's own
+  always-available `jumpLastRouted` behavior. **Real ceiling, confirmed
+  live, not fixable in JS**: ⌥⌘J only works while keyboard focus is on
+  Vivaldi's own chrome, not while it's on the actual page (`<webview>` runs
+  in a separate process; its keydowns never reach `window.html`'s own
+  `document`, unlike Vivaldi's own native shortcuts, which are intercepted
+  at a privileged level no injected page JS can reach) — meaning it won't
+  fire in the single most common moment you'd want it, right after clicking
+  a link on a page. The relay's curl endpoint has no such limitation, since
+  it never goes through `window.html`'s DOM at all — see "Triggering a jump
+  from outside Vivaldi" below for how to reach it without Keyboard Maestro.
+- `relay/server.js` — small local Node process (WebSocket + a one-route HTTP
+  server) that lets an external hotkey ask `main.html`'s script to run
+  `jumpToLastRoutedTab()` (jumps to whatever was routed most recently, even
+  after its toast has already disappeared), without needing
+  `--remote-debugging-port`/CDP. The injected script connects *out* to it.
+  Needs to always be running — install
+  `relay/com.aaron.vivaldi-workspace-relay.plist` as a LaunchAgent (`cp` to
+  `~/Library/LaunchAgents/`, then `launchctl load`). Also handles the
+  reverse direction: `jumpToTab` mirrors `bridge/workspace-jump.js`'s own
+  two-branch decision exactly — if the routed tab's workspace already has a
+  window, just focus it (moving the tab there if it's parked somewhere
+  else); if not, create a **new blank window** and ask the relay to run the
+  *same* Window-menu-click AppleScript `workspace-jump.js` uses to assign
+  it, then move the tab in. It deliberately never force-switches some
+  unrelated existing window's displayed workspace — that's the exact
+  silent-reassignment behavior this whole project exists to avoid (see the
+  planning doc's "Rejected approach"). This means every jump (click, ⌥⌘J, or
+  the curl endpoint) depends on the relay being up, even though only the
+  curl path is externally triggered through it.
+### Triggering a jump from outside Vivaldi (no Keyboard Maestro required)
+
+Three ways to reach the relay's `GET /jump-last-routed` endpoint from an
+OS-level hotkey, in the order this project recommends trying them — all
+three are purely additive (nothing about the relay or the injected scripts
+changes based on which one you use), so it's fine to have more than one set
+up at once:
+
+1. **macOS Shortcuts.app (recommended)** — create a shortcut with a single
+   "Get Contents of URL" action pointed at
+   `http://127.0.0.1:8877/jump-last-routed` (GET; no need to show the
+   result), then give it a keyboard shortcut via its own Details pane ("Add
+   Keyboard Shortcut"). This registers a real OS-level global hotkey — works
+   even when Vivaldi isn't the frontmost app — without touching Vivaldi's
+   own extension/keybinding system at all, so the Vivaldi bug described in
+   option 2 below is irrelevant to this path entirely. Not yet confirmed:
+   whether triggering it via the assigned keyboard shortcut (as opposed to
+   the `shortcuts://` URL-scheme path) briefly flashes open the Shortcuts
+   app or runs fully silently — very likely silent, but unverified on this
+   machine.
+2. **`extension/` (optional, in-browser alternative)** — a small, separate
+   Chrome/Vivaldi extension (`manifest.json` + `background.js`; not part of
+   the injected scripts above and not installed the same way): declares a
+   `chrome.commands` shortcut (suggested to ⌥⌘J), and its background service
+   worker just `fetch()`es the relay endpoint on trigger. Install via
+   `vivaldi://extensions` → enable Developer Mode → Load unpacked → select
+   `extension/`. **Unverified as of 2026-08-09**: Vivaldi has a
+   long-standing, still-open bug (see the planning doc's 2026-08-09 section
+   for forum links) where extension-declared shortcuts in the default ("In
+   Vivaldi") scope often don't fire at all; the documented workaround is
+   switching the command's scope to "Global" in `vivaldi://extensions` →
+   Keyboard Shortcuts, though it's unknown without live testing whether that
+   accepts ⌥⌘J as typed or forces it down to a `Ctrl+Shift+[0-9]`-style combo
+   the way Chrome's own native global-command restriction does. Also: any
+   unpacked/developer-mode extension makes Chromium show a "Disable
+   Developer Mode Extensions" warning on every browser startup — a
+   recurring cost the Shortcuts.app path above doesn't have.
+3. **Keyboard Maestro (still works, no longer required)** — hotkey →
+   "Execute Shell Script" → `curl -s http://127.0.0.1:8877/jump-last-routed`.
+   Kept working for anyone who already has it set up; no longer the
+   recommended path for a fresh install, since it's a paid tool and options
+   1–2 cover the same need for free.
+
+**Finding a routed tab without setting up any of the above**: Vivaldi's own
+Quick Commands (⌘E, optionally prefixed with `tab:` to search only open
+tabs) can already find and switch to any open tab, including one currently
+sitting in a workspace with no window displaying it — confirmed in
+Vivaldi's own help docs, not yet re-verified live on this exact build. The
+History menu does *not* do this — double-clicking an entry reloads the
+*current* tab fresh rather than finding/focusing an existing one — worth
+knowing since it looks like it should work and doesn't.
+
+Both injected files must be reinstalled (`injected/install.sh`) after every
+Vivaldi update, same caveat as the theme-switcher, and Vivaldi must be fully
+restarted after installing/updating either one — `main.html` and every open
+window's `window.html` are only read at their own startup.
+
+This intentionally leaves `bridge/`, `wrapper-app/`, and the existing
+per-workspace Keyboard Maestro macros untouched. If the relay proves
+reliable, migrating the *original* per-workspace jump onto it too (retiring
+CDP/the wrapper app/the debug port entirely) is a natural follow-up, not yet
+done — see the planning doc.
+
+## Debugging
+
+- `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
+  a specific window's entry (for its toast) → **inspect**. Watch for
+  `[VWH]`-prefixed console lines (the watcher, in `main.html`),
+  `[VWH-toast]`-prefixed ones (the toast, per-window in `window.html`), and
+  `[WTS]`-prefixed ones (the sibling theme-switcher, if also installed).
+- `window.__vwh` is exposed at runtime in `main.html` for live inspection:
+  `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`.
+- Relay logs: `~/Library/Logs/vivaldi-workspace-relay.log`.

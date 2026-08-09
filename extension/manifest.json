@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Vivaldi Workspace Helper -- Jump to Routed Tab",
+  "version": "1.0.0",
+  "description": "Keyboard shortcut that asks the Vivaldi Workspace Helper relay to jump to whatever tab was last auto-routed to a background workspace.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "jump-last-routed": {
+      "suggested_key": {
+        "default": "Alt+Shift+J",
+        "mac": "Alt+Command+J"
+      },
+      "description": "Jump to the last auto-routed tab"
+    }
+  },
+  "host_permissions": ["http://127.0.0.1:8877/*"]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "vivaldi-workspace-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local WebSocket/HTTP relay between an external hotkey and the workspace-route-watcher script injected into Vivaldi's main.html.",
+  "main": "server.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
