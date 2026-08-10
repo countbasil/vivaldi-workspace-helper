@@ -930,3 +930,44 @@ the extension (does it fire at all in either scope, and what does Vivaldi's
 Global-scope UI actually accept?), or Quick Commands on this exact build --
 all deferred until Aaron is back at the keyboard, consistent with this
 project's standing rule of confirming live rather than assuming.
+
+### Removed the in-page ⌥⌘J listener entirely (2026-08-09)
+
+Setting up the Keyboard Maestro macro for the relay path (hotkey → curl
+`/jump-last-routed`) raised an immediate question: `window-toast.js` still
+had its own separate, in-page ⌥⌘J listener from earlier in the session (see
+"Global ⌥⌘J" above). Binding the same combo in an external tool meant both
+could now fire for a single keypress whenever Vivaldi's own chrome (not a
+webview) had focus -- the one condition the in-page listener could ever
+actually fire under. Flagged this as a real, if edge-case, risk rather than
+just noise: two near-simultaneous `jumpToLastRoutedTab()` calls racing
+against each other could both decide the target workspace has no window yet
+and each create one, rather than one call creating it and the second
+correctly finding what the first just made.
+
+Aaron asked the sharper question directly: given the finding earlier this
+session was that the in-page listener *never* fires in the one moment it's
+actually needed (right after clicking a link, when a webview has focus),
+and the relay-based triggers now cover every case unconditionally (including
+that one), what was the remaining case for keeping it at all? None, on
+reflection -- its "sometimes works" coverage (only while focus happens to be
+on Vivaldi's own chrome, e.g. right after opening a tab or using the address
+bar) was already a strict subset of what Shortcuts.app/the extension/
+Keyboard Maestro now provide unconditionally. The one asymmetry worth
+naming and then setting aside: the in-page listener didn't depend on the
+relay process being up, since it messaged `main.html` directly via
+`chrome.runtime.sendMessage` rather than going out over the network at all.
+That's a real but narrow resilience margin -- covering only the already-rare
+"relay happens to be down AND focus happens to be on Vivaldi's chrome, not a
+page" intersection -- and not worth keeping the double-trigger race for.
+
+Removed: `onKeydown` and its `keydown` listener registration from
+`window-toast.js` (along with the now-unused `SHORTCUT_LABEL` constant and
+the toast's "Click or ⌥⌘J to switch" wording, which becomes misleading once
+the actual key binding lives entirely in user-chosen external configuration
+rather than this project's own code), and the now-dead
+`"vwh-jump-last-routed"` branch of `workspace-route-watcher.js`'s
+`chrome.runtime.onMessage` listener that only that removed sender ever
+targeted. The toast's click-to-jump behavior and the relay's own
+`jumpLastRouted` path are both completely unaffected -- this only removed
+the one redundant, narrowly-scoped, race-prone path to the same action.

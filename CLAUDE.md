@@ -170,27 +170,29 @@ on screen (`window.html`, one instance per open window):
   points across the toast). Background opacity is `TOAST_OPACITY` (a
   constant at the top, currently `0.6`); auto-dismisses after
   `TOAST_DURATION_MS` (also freely tweakable). Three `variant`s share this
-  renderer: `"route"` (default) is interactive — click or **⌥⌘J** sends a
+  renderer: `"route"` (default) is interactive — click sends a
   `vwh-jump-request` back to `main.html`; `"foreground-switch"` and
   `"raised-window"` are informational — click just dismisses, nothing to
-  jump to. ⌥⌘J itself (checked via `e.code`, not `e.key` — Option remaps
-  `e.key` to a dead-key character on macOS) is a **global** listener
-  attached once at init, not tied to a toast being visible — it used to be
-  toast-scoped, but `TOAST_DURATION_MS` is easy to miss if you don't react
-  immediately, and there was then no listener left by the time the shortcut
-  was actually pressed. It always asks `main.html` for whatever was most
-  recently routed (`vwh-jump-last-routed`, handled by `jumpToLastRoutedTab`)
-  rather than a specific toast's target, mirroring the relay's own
-  always-available `jumpLastRouted` behavior. **Real ceiling, confirmed
-  live, not fixable in JS**: ⌥⌘J only works while keyboard focus is on
-  Vivaldi's own chrome, not while it's on the actual page (`<webview>` runs
-  in a separate process; its keydowns never reach `window.html`'s own
-  `document`, unlike Vivaldi's own native shortcuts, which are intercepted
-  at a privileged level no injected page JS can reach) — meaning it won't
-  fire in the single most common moment you'd want it, right after clicking
-  a link on a page. The relay's curl endpoint has no such limitation, since
-  it never goes through `window.html`'s DOM at all — see "Triggering a jump
-  from outside Vivaldi" below for how to reach it without Keyboard Maestro.
+  jump to.
+
+  **No in-page keyboard shortcut here anymore (removed 2026-08-09).** This
+  used to also listen for ⌥⌘J directly (`document.addEventListener`,
+  checked via `e.code` since Option remaps `e.key` to a dead-key character
+  on macOS) as a global, always-on fallback, sending a
+  `vwh-jump-last-routed` message to `main.html`. **Real ceiling, confirmed
+  live, not fixable in JS**: it only ever worked while keyboard focus was on
+  Vivaldi's own chrome, not on the actual page (`<webview>` runs in a
+  separate process; its keydowns never reach `window.html`'s own `document`,
+  unlike Vivaldi's own native shortcuts, which are intercepted at a
+  privileged level no injected page JS can reach) — meaning it never fired
+  in the single most common moment you'd want it, right after clicking a
+  link on a page. Once "Triggering a jump from outside Vivaldi" below
+  existed, that narrow, unreliable coverage became a strict subset of what
+  the relay already provides from anywhere regardless of focus — and worse
+  than merely redundant: binding the same key in an external tool meant both
+  paths could fire for one keypress, which could race and create two
+  windows for a windowless target workspace. Removed rather than kept as a
+  "best-effort" extra; see the planning doc's 2026-08-09 section.
 - `relay/server.js` — small local Node process (WebSocket + a one-route HTTP
   server) that lets an external hotkey ask `main.html`'s script to run
   `jumpToLastRoutedTab()` (jumps to whatever was routed most recently, even
@@ -207,16 +209,20 @@ on screen (`window.html`, one instance per open window):
   it, then move the tab in. It deliberately never force-switches some
   unrelated existing window's displayed workspace — that's the exact
   silent-reassignment behavior this whole project exists to avoid (see the
-  planning doc's "Rejected approach"). This means every jump (click, ⌥⌘J, or
-  the curl endpoint) depends on the relay being up, even though only the
-  curl path is externally triggered through it.
+  planning doc's "Rejected approach"). This means every jump — a toast
+  click, or an external trigger via any of the options below — depends on
+  the relay being up whenever the target workspace needs a brand-new window
+  created and assigned.
+
 ### Triggering a jump from outside Vivaldi (no Keyboard Maestro required)
 
 Three ways to reach the relay's `GET /jump-last-routed` endpoint from an
 OS-level hotkey, in the order this project recommends trying them — all
 three are purely additive (nothing about the relay or the injected scripts
 changes based on which one you use), so it's fine to have more than one set
-up at once:
+up at once. There's no in-page keyboard shortcut anymore (⌥⌘J used to be
+handled directly inside `window.html` — see `window-toast.js`'s entry above
+for why that was removed rather than kept as a "best-effort" extra):
 
 1. **macOS Shortcuts.app (recommended)** — create a shortcut with a single
    "Get Contents of URL" action pointed at

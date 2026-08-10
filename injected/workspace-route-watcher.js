@@ -317,7 +317,11 @@
       const displayingWindowId = findWindowDisplayingWorkspace(routedTab.workspaceId);
       if (displayingWindowId != null && displayingWindowId === routedTab.windowId) {
         console.log(TAG, "Raising existing window for foreground-intent route:", routedTab);
+        // Raising the window alone leaves whatever tab was already selected
+        // there in front -- the newly-arrived routed tab is in the window
+        // but not necessarily the one on screen. Select it too.
         await chrome.windows.update(routedTab.windowId, { focused: true });
+        await chrome.tabs.update(routedTab.tabId, { active: true });
         showRaisedWindowToast(routedTab);
       } else {
         console.log(TAG, "Foreground-intent tab landed somewhere not displaying its workspace -- falling back to click-to-jump:", routedTab);
@@ -602,11 +606,20 @@
       checkWorkspaceTagThenHandle(tab);
     });
     // window-toast.js (running in window.html, the only place with a
-    // viewport) sends these. "vwh-jump-request" is a toast click (a
-    // specific tab); "vwh-jump-last-routed" is the global ⌥⌘J shortcut
-    // (always live, not tied to a toast being visible -- see
-    // window-toast.js's onKeydown), same "whatever was most recently
-    // routed" semantics the relay's jumpLastRouted already has.
+    // viewport) sends this on a toast click, naming the specific tab it
+    // pointed at. (There used to be a second message type here,
+    // "vwh-jump-last-routed", sent by an in-page ⌥⌘J keydown listener in
+    // window-toast.js -- removed 2026-08-09. It only ever worked while
+    // keyboard focus happened to be on Vivaldi's own chrome, never while a
+    // webview had focus, and that coverage is now a strict subset of what
+    // the relay's own jumpLastRouted already provides from anywhere,
+    // regardless of focus -- see connectRelay's message handler above and
+    // CLAUDE.md's "Triggering a jump from outside Vivaldi" section. Keeping
+    // both around meant a real risk, not just redundancy: bind the same
+    // key in an external tool and the two paths could both fire for one
+    // keypress, and if the target workspace was windowless, two
+    // near-simultaneous jumpToLastRoutedTab() calls could race and create
+    // two windows for it.)
     chrome.runtime.onMessage.addListener((message) => {
       if (!message) return;
       // Nothing round-trips either result back to window.html (the toast,
@@ -616,10 +629,6 @@
       if (message.type === "vwh-jump-request") {
         jumpToTab(message.tabId, message.workspaceId, message.workspaceName).then((result) => {
           if (!result.ok) console.error(TAG, "jumpToTab failed:", result.reason, message);
-        });
-      } else if (message.type === "vwh-jump-last-routed") {
-        jumpToLastRoutedTab().then((result) => {
-          if (!result.ok) console.error(TAG, "jumpToLastRoutedTab (keyboard) failed:", result.reason);
         });
       }
     });

@@ -20,7 +20,6 @@
   // through the toast's background.
   const TOAST_OPACITY = 0.6;
   const FALLBACK_EMOJI = "❓"; // used only if the workspace's own emoji can't be resolved ( ❓ )
-  const SHORTCUT_LABEL = "⌥⌘J"; // Option+Cmd+J -- always listened for, jumps to whatever was last routed
 
   let myWindowId = null;
   let toastEl = null;
@@ -36,30 +35,6 @@
       workspaceName: activeTarget.workspaceName,
     });
     dismissToast();
-  }
-
-  // Global and always-on (attached once at init, not tied to a toast being
-  // visible) -- confirmed live that scoping this to only while a toast is
-  // showing was a real problem: TOAST_DURATION_MS is easy to miss if you
-  // don't react immediately, and there was then no listener left at all by
-  // the time the shortcut was actually pressed. Always asks main.html for
-  // whatever was most recently routed (mirrors the relay's jumpLastRouted),
-  // rather than the specific tab a possibly-already-dismissed toast pointed
-  // to -- reachable from any window, matching the relay/curl path's own
-  // always-available behavior, just without needing that external hop.
-  function onKeydown(e) {
-    // e.key (not e.code) is unusable here: holding Option remaps it to
-    // whatever dead-key/special character that modifier produces on the
-    // current keyboard layout (e.g. "∆" for Option+J on a US layout),
-    // never the literal letter -- confirmed this was why the shortcut
-    // silently never matched. e.code identifies the physical key and is
-    // unaffected by modifiers or layout.
-    if (e.altKey && e.metaKey && !e.ctrlKey && !e.shiftKey && e.code === "KeyJ") {
-      e.preventDefault();
-      e.stopPropagation();
-      chrome.runtime.sendMessage({ type: "vwh-jump-last-routed" });
-      if (toastEl) dismissToast();
-    }
   }
 
   // Positioning against the window as a whole (e.g. a fixed top:16px) can
@@ -142,7 +117,7 @@
     } else if (variant === "raised-window") {
       el.textContent = `Raised window with ${emoji} ${workspaceLabel}`;
     } else {
-      el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick or ${SHORTCUT_LABEL} to switch`;
+      el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick to switch`;
     }
 
     if (interactive) {
@@ -169,7 +144,6 @@
       if (win) myWindowId = win.id;
       console.log(TAG, "Ready in window", myWindowId);
     });
-    document.addEventListener("keydown", onKeydown, true);
   }
 
   function waitForReady() {
