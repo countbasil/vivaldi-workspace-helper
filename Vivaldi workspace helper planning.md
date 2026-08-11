@@ -971,3 +971,52 @@ rather than this project's own code), and the now-dead
 targeted. The toast's click-to-jump behavior and the relay's own
 `jumpLastRouted` path are both completely unaffected -- this only removed
 the one redundant, narrowly-scoped, race-prone path to the same action.
+
+### Externally-opened routed tabs now jump automatically instead of requiring a toast click (2026-08-10)
+
+Aaron's request: when an external app launches a link that Vivaldi routes to
+another workspace, he should land directly on that tab -- not have to
+notice and click a toast first -- whether or not a window already exists for
+the destination workspace, and with a new window created and assigned when
+one doesn't.
+
+The fifth case (`handleBackgroundTab`'s `wasOriginallyActive` branch,
+covering tabs that were foreground/`active: true` at creation -- the signal
+already confirmed to distinguish real external opens from cmd+click, see the
+2026-08-08 "Distinguishing how a tab was opened" section) previously did one
+of two things: raise the existing window if it was confirmed to already be
+displaying the target workspace, or -- after the 2026-08-09 wrong-window bug
+fix above -- fall through to the ordinary interactive "click to switch"
+toast whenever it wasn't (including the fully windowless case). Both of
+those still made the user act on a toast for anything other than the
+already-displaying-window case.
+
+Changed `handleBackgroundTab` to call `jumpToTab` directly for this branch
+instead: the same function already used for a toast click and for the
+relay's `jumpLastRouted`, which re-derives the real target window itself via
+`findWindowDisplayingWorkspace(workspaceId)` (existing window → focus it;
+none → create a blank window and assign it via the relay's
+`activateWorkspaceViaMenu`, exactly mirroring `bridge/workspace-jump.js`'s
+own two-branch decision) and moves/activates the tab there. This
+incidentally subsumes the 2026-08-09 bug fix rather than needing it as a
+special case: since `jumpToTab` always re-derives the target window fresh
+from the workspace store instead of trusting wherever the tab happened to
+land, there's no "wrong window" to mistakenly raise in the first place.
+
+`jumpToTab` now also returns `created: true/false` so the resulting toast
+can say which happened. Both outcomes remain purely informational (click
+just dismisses -- the jump already happened by the time the toast appears):
+`"raised-window"` ("Raised window with `<emoji>` `<name>`", unchanged
+wording) when an existing window was focused, and a new `"created-window"`
+variant ("Created window for `<emoji>` `<name>`") when none existed. If
+`jumpToTab` itself fails (e.g. the relay is down and a new window/assignment
+was needed), falls back to the ordinary interactive click-to-jump toast
+rather than silently doing nothing.
+
+This intentionally only changes the foreground-intent (externally-opened)
+branch. Cmd+click and other genuinely-background routes (`wasOriginallyActive
+=== false`) are unchanged and still show the interactive click-to-jump
+toast -- Aaron's request was specifically about external-app opens, and an
+automatic, un-asked-for window jump for a tab the user opened *without*
+foreground intent would be a real regression (surprising a user who
+deliberately opened something in the background).

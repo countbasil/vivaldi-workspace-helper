@@ -45,9 +45,12 @@ Separate from the CDP-based jump feature above, and **deliberately not
 built the same way** — see the planning doc's 2026-08-08 section for the
 full rationale. Detects when Vivaldi's "open websites in workspaces
 automatically" rule (Settings → workspace rules) routes an incoming URL into
-a window that isn't currently focused, and shows a toast naming the
-destination workspace/tab, with click-to-jump, an in-toast keyboard
-shortcut, and an external-hotkey fallback.
+a window that isn't currently focused. A tab that was opened by an external
+app (foreground intent — see the fifth-case note below) jumps there
+automatically, creating and assigning a window first if the destination
+workspace doesn't have one yet; other background routes (e.g. cmd+click)
+instead show a toast naming the destination workspace/tab with
+click-to-jump, plus an external-hotkey fallback that works for either case.
 
 This is split across **two** injection points, because the document that can
 detect the route (`main.html`) isn't the document that can draw anything
@@ -123,14 +126,11 @@ on screen (`window.html`, one instance per open window):
   detection path: an externally-opened tab that lands in an *existing*
   different window (not windowless) doesn't get raised to the front by
   Vivaldi either — confirmed live, it just sits there unfocused, same as a
-  cmd+click route would. `handleBackgroundTab` raises that window itself and
-  shows "Raised window with `<emoji>` `<name>`" (click dismisses, nothing to
-  jump to) instead of the click-to-jump toast, whenever the tab was
-  originally foreground-intent. "Externally opened"/foreground-intent is
-  recognized by `tab.active === true` **at creation time specifically** —
-  confirmed live (both a synthetic `chrome.tabs.move` and a genuine external
-  open) that Vivaldi resets a tab's `active` flag to `false` the instant it
-  lands via a cross-window move, regardless of how it started, so checking
+  cmd+click route would. "Externally opened"/foreground-intent is recognized
+  by `tab.active === true` **at creation time specifically** — confirmed
+  live (both a synthetic `chrome.tabs.move` and a genuine external open)
+  that Vivaldi resets a tab's `active` flag to `false` the instant it lands
+  via a cross-window move, regardless of how it started, so checking
   `active` on the settled tab (after the move) always reads `false` and
   can't distinguish anything. `tabOriginalActiveState` (tabId → `active` at
   `onCreated`, captured before any move can touch it) is the fix; `active`
@@ -139,23 +139,35 @@ on screen (`window.html`, one instance per open window):
   empirically; address-bar entry doesn't even create a new tab (navigates
   in place), so it never reaches any of this code at all.
 
-  **Bug found and fixed (2026-08-09)**: the fifth case's "raise" branch
-  assumed `routedTab.windowId` (whatever window the tab landed in) was
-  necessarily displaying `routedTab.workspaceId` (the tab's own workspace)
-  — true whenever Vivaldi actually routes the tab to a real window for that
-  workspace, but not always. Confirmed live: when the *frontmost* window has
-  no workspace binding of its own, and the target workspace also has no
-  window, Vivaldi doesn't do the fourth case's usual in-place reassignment
-  of the frontmost window — it drops the tab into some other, unrelated,
-  already-open window instead (tagging it with the target workspace via
-  `vivExtData` without ever making that window display it). Symptom: a
-  toast reading "Raised window with Devel" while the window actually raised
-  was displaying Work. Fix: `handleBackgroundTab` now confirms via
-  `findWindowDisplayingWorkspace` that the window it's about to raise
-  actually displays the claimed workspace before taking the raise branch;
-  otherwise it falls through to the normal click-to-jump toast, which
-  already resolves correctly once clicked (`jumpToTab` moves the tab if it
-  isn't already sitting in the target window).
+  **Externally-opened routes jump automatically (changed 2026-08-10, see the
+  planning doc's 2026-08-10 section for the full history)**: rather than
+  showing a toast the user has to click, `handleBackgroundTab`'s
+  foreground-intent branch calls `jumpToTab` directly and immediately — the
+  same function used for a toast click and the relay's `jumpLastRouted` —
+  which re-derives the real target window fresh via
+  `findWindowDisplayingWorkspace(workspaceId)` (found → focus it; none →
+  create a blank window and assign it via the relay, exactly mirroring
+  `bridge/workspace-jump.js`'s own two-branch decision) and moves/activates
+  the tab there. Deriving the target fresh rather than trusting
+  `routedTab.windowId` (wherever the tab happened to land) also subsumes a
+  bug fixed 2026-08-09 under the old raise-or-fallback design: when the
+  *frontmost* window had no workspace binding of its own and the target
+  workspace also had no window, Vivaldi doesn't do the fourth case's usual
+  in-place reassignment — it drops the tab into some other, unrelated,
+  already-open window instead (tagging it via `vivExtData` without ever
+  making that window display it), which the old code could mistake for the
+  right window to raise (symptom: a toast reading "Raised window with Devel"
+  while the window actually raised was displaying Work). `jumpToTab` never
+  makes that assumption, so there's no special case needed for it anymore.
+  The resulting toast is still purely informational (click just dismisses —
+  the jump already happened): `"raised-window"` when an existing window was
+  focused, or `"created-window"` when one had to be created and assigned.
+  If `jumpToTab` itself fails (e.g. the relay is down and a new
+  window/assignment was needed), falls back to the ordinary interactive
+  click-to-jump toast. Cmd+click and other genuinely-background routes
+  (`wasOriginallyActive === false`) are unchanged — still the interactive
+  click-to-jump toast, since an unrequested automatic jump for a
+  deliberately-backgrounded tab would be a real regression, not a fix.
 - `injected/window-toast.js` — plain JS injected into `window.html` (the
   visible per-window chrome document; every open window loads its own
   instance of the same file), also via `injected/install.sh`. Listens for
@@ -169,11 +181,13 @@ on screen (`window.html`, one instance per open window):
   (confirmed live via `document.elementFromPoint` hit-testing at several
   points across the toast). Background opacity is `TOAST_OPACITY` (a
   constant at the top, currently `0.6`); auto-dismisses after
-  `TOAST_DURATION_MS` (also freely tweakable). Three `variant`s share this
+  `TOAST_DURATION_MS` (also freely tweakable). Four `variant`s share this
   renderer: `"route"` (default) is interactive — click sends a
-  `vwh-jump-request` back to `main.html`; `"foreground-switch"` and
-  `"raised-window"` are informational — click just dismisses, nothing to
-  jump to.
+  `vwh-jump-request` back to `main.html`; `"foreground-switch"`,
+  `"raised-window"`, and `"created-window"` are informational — click just
+  dismisses, nothing to jump to (the jump, if any, already happened
+  automatically by the time the toast appears — see the "Externally-opened
+  routes jump automatically" note above).
 
   **No in-page keyboard shortcut here anymore (removed 2026-08-09).** This
   used to also listen for ⌥⌘J directly (`document.addEventListener`,

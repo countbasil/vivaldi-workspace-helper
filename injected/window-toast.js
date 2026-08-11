@@ -75,11 +75,13 @@
     // "route" (default, undefined variant) is the only interactive one --
     // there's an actual tab to jump to. "foreground-switch" (Vivaldi
     // reassigned the *current* window's own workspace in place -- see
-    // workspace-route-watcher.js's onWorkspaceStoreChanged) and
-    // "raised-window" (an existing background window was raised
-    // automatically -- see handleBackgroundTab's active-tab branch) are
-    // both purely informational: whatever they're telling you about
-    // already happened, so clicking just dismisses instead of jumping.
+    // workspace-route-watcher.js's onWorkspaceStoreChanged), "raised-window"
+    // (an existing window already displaying the target workspace was
+    // focused automatically), and "created-window" (no window displayed the
+    // target workspace, so one was created and assigned automatically) --
+    // see handleBackgroundTab's active-tab branch for all three -- are
+    // purely informational: whatever they're telling you about already
+    // happened, so clicking just dismisses instead of jumping.
     const variant = message.variant || "route";
     const interactive = variant === "route";
     if (interactive) {
@@ -116,6 +118,8 @@
       el.textContent = `Vivaldi changed window to ${emoji} ${workspaceLabel}`;
     } else if (variant === "raised-window") {
       el.textContent = `Raised window with ${emoji} ${workspaceLabel}`;
+    } else if (variant === "created-window") {
+      el.textContent = `Created window for ${emoji} ${workspaceLabel}`;
     } else {
       el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick to switch`;
     }

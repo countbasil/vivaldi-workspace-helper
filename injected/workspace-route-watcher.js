@@ -226,13 +226,15 @@
     });
   }
 
-  // Tells the (newly-raised) destination window's own toast instance, not
-  // wherever the user was looking before -- see showRaisedWindowToast.
-  function showRaisedWindowToast(routedTab) {
+  // Tells the destination window's own toast instance (wherever jumpToTab
+  // actually landed the tab -- result.windowId, NOT routedTab.windowId,
+  // which is only where the tab originally happened to land before being
+  // moved) that the jump already happened, informationally.
+  function showJumpedToast(routedTab, result) {
     chrome.runtime.sendMessage({
       type: "vwh-show-toast",
-      variant: "raised-window",
-      displayWindowId: routedTab.windowId,
+      variant: result.created ? "created-window" : "raised-window",
+      displayWindowId: result.windowId,
       workspaceName: routedTab.workspaceName,
       workspaceEmoji: routedTab.workspaceEmoji,
     });
@@ -292,40 +294,39 @@
     const wasOriginallyActive = tabOriginalActiveState.has(tab.id) ? tabOriginalActiveState.get(tab.id) : freshTab.active;
 
     if (wasOriginallyActive) {
-      // Externally-opened (or otherwise explicitly-foreground) tabs
-      // *usually* land in a window that's actually displaying the target
-      // workspace, which Vivaldi confirmed-live doesn't raise automatically
-      // -- so raise it ourselves rather than showing the click-to-jump
-      // toast, since the user evidently wanted to see this immediately.
-      // But that assumption isn't always true: confirmed live, when the
-      // *frontmost* window has no workspace binding of its own and the
-      // target workspace also has no window, Vivaldi doesn't do its usual
-      // in-place reassignment of the frontmost window (see
-      // onWorkspaceStoreChanged) -- it drops the tab into some other,
-      // unrelated, already-open window instead, tagging the tab with the
-      // target workspace via vivExtData without ever making that window
-      // display it. routedTab.windowId is that unrelated window;
-      // routedTab.workspaceName is the target -- raising the former under
-      // the latter's name would show the wrong content with a confidently
-      // wrong label (seen live: raised a window showing "Work" while
-      // announcing "Raised window with Devel"). Only raise when the window
-      // the tab actually landed in is confirmed to be displaying the target
-      // workspace; otherwise fall through to the normal interactive toast,
-      // which is the right thing to show anyway ("opened in X, click to
-      // switch") and already resolves correctly once clicked -- jumpToTab
-      // moves the tab if it isn't already in the target window.
-      const displayingWindowId = findWindowDisplayingWorkspace(routedTab.workspaceId);
-      if (displayingWindowId != null && displayingWindowId === routedTab.windowId) {
-        console.log(TAG, "Raising existing window for foreground-intent route:", routedTab);
-        // Raising the window alone leaves whatever tab was already selected
-        // there in front -- the newly-arrived routed tab is in the window
-        // but not necessarily the one on screen. Select it too.
-        await chrome.windows.update(routedTab.windowId, { focused: true });
-        await chrome.tabs.update(routedTab.tabId, { active: true });
-        showRaisedWindowToast(routedTab);
-      } else {
-        console.log(TAG, "Foreground-intent tab landed somewhere not displaying its workspace -- falling back to click-to-jump:", routedTab);
+      // Externally-opened (or otherwise explicitly-foreground) tabs carry
+      // clear intent to be seen right away -- jump there automatically
+      // instead of making the user click a toast first. jumpToTab (below,
+      // shared with the toast-click and relay paths) re-derives the real
+      // target window itself via findWindowDisplayingWorkspace(workspaceId)
+      // rather than trusting routedTab.windowId (which is only wherever the
+      // tab happened to land, not necessarily a window displaying its
+      // workspace -- confirmed live, a windowless target can land in some
+      // unrelated already-open window without that window ever displaying
+      // it), and creates + assigns a brand-new window when no window
+      // displays the target workspace at all. That sidesteps needing the
+      // old "is this really the right window" special case entirely: if it
+      // doesn't already exist, it doesn't have a display mismatch either.
+      if (routedTab.workspaceId == null) {
+        // Workspace couldn't be resolved (e.g. vivExtData missing/stale) --
+        // jumpToTab has nothing to target and would just no-op-refocus the
+        // tab's current window under an "(unknown workspace)" label. Fall
+        // back to the interactive toast, same as the unresolved case always
+        // behaved before this change.
+        console.log(TAG, "Foreground-intent route with unresolved workspace -- falling back to click-to-jump:", routedTab);
         showToast(routedTab);
+      } else {
+        console.log(TAG, "Foreground-intent route -- jumping automatically:", routedTab);
+        const result = await jumpToTab(routedTab.tabId, routedTab.workspaceId, routedTab.workspaceName);
+        if (result.ok) {
+          showJumpedToast(routedTab, result);
+        } else {
+          // e.g. the relay is down and a new window/workspace assignment was
+          // needed -- fall back to the interactive toast so the user still
+          // has a way to jump once the underlying problem is fixed.
+          console.error(TAG, "Automatic jump failed, falling back to click-to-jump:", result.reason);
+          showToast(routedTab);
+        }
       }
     } else {
       console.log(TAG, "Background-routed tab detected:", routedTab);
@@ -450,12 +451,14 @@
   async function jumpToTab(tabId, workspaceId, workspaceName) {
     try {
       let targetWindowId = findWindowDisplayingWorkspace(workspaceId);
+      let created = false;
 
       if (targetWindowId != null) {
         await chrome.windows.update(targetWindowId, { focused: true });
       } else if (workspaceName) {
         const newWin = await new Promise((resolve) => chrome.windows.create({}, resolve));
         targetWindowId = newWin.id;
+        created = true;
         // No extra focus call needed here -- a freshly created window is
         // already the focused one, and activateWorkspaceViaMenu's own
         // "tell application Vivaldi to activate" acts on it directly, same
@@ -477,7 +480,7 @@
       }
       await chrome.tabs.update(tabId, { active: true });
 
-      return { ok: true, windowId: targetWindowId, tabId, workspaceName };
+      return { ok: true, windowId: targetWindowId, tabId, workspaceName, created };
     } catch (e) {
       return { ok: false, reason: String((e && e.message) || e) };
     }
