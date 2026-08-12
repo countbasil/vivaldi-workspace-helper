@@ -1,27 +1,45 @@
 # Vivaldi Workspace Helper
 
-Keyboard-driven jumping to a specific Vivaldi workspace — activating Vivaldi
-and creating/assigning a new window if the workspace isn't open yet, without
-ever silently reassigning an unrelated existing window — plus a toast+jump
-system for tabs that Vivaldi's "open websites in workspaces automatically"
-rule routes into the background.
+Vivaldi's workspaces are great, but nothing built-in gets you *to* the right
+one quickly and safely — its own per-workspace shortcut can silently
+reassign whatever window is currently focused, hiding tabs you didn't mean
+to touch (see the planning doc's "Rejected approach" section for why that
+ruled out the obvious Keyboard Maestro + built-in-shortcut approach). This
+project is three features that each solve a different piece of "get me to
+the right workspace window without that happening":
+
+- **Feature 1 — auto-jump for externally-opened routed tabs.** A link opened
+  from another app (or similar) that Vivaldi's "open websites in workspaces
+  automatically" rule (Settings → Workspace Rules) routes to a workspace
+  takes you there immediately: switches to the window already showing that
+  workspace, or creates a new window and assigns it if none exists yet. No
+  toast, no click — it just happens.
+- **Feature 2 — toast + jump for routed tabs opened from inside Vivaldi.**
+  Cmd+clicking a link (or opening a new tab and entering a URL) that gets
+  routed to a workspace shows a toast naming where it went. Click the toast
+  to jump there — creating and assigning a window first if one doesn't
+  exist yet, so the tabs already in the foreground window aren't disturbed.
+  You can also trigger that same jump *without* clicking, via an external
+  hotkey utility (see below for why that has to be external rather than a
+  keybinding inside Vivaldi's own page JS).
+- **Feature 3 — jump-to-workspace hotkeys, triggered from outside Vivaldi.**
+  A hotkey (via Keyboard Maestro or similar) that activates Vivaldi and
+  switches to whichever window is showing a *specific, named* workspace —
+  creating and assigning a new window for it if none exists yet. Useful for
+  e.g. a global hotkey that always takes you to wherever your Claude
+  conversations are routed, whenever you want to use Claude, regardless of
+  whether that window already happens to be open.
+
+Features 1 and 2 are two branches of the same underlying detection code and
+share one install step. Feature 3 is a separate, older mechanism (CDP
+instead of injected page JS) with its own install step. All three can be
+installed independently of each other.
 
 For the full design rationale (including a rejected first approach and every
 bug found along the way), see
 [`Vivaldi workspace helper planning.md`](Vivaldi%20workspace%20helper%20planning.md).
 [`CLAUDE.md`](CLAUDE.md) orients an AI assistant to the codebase; this file
 is just the human install guide.
-
-Two independent features live here — install only the one(s) you want:
-
-- **Feature 1 — jump-to-workspace hotkeys**: `bridge/` + `wrapper-app/` +
-  Keyboard Maestro. Requires Vivaldi to always run with
-  `--remote-debugging-port` enabled.
-- **Feature 2 — toast + auto-jump for routed tabs**: `injected/` + `relay/`
-  (+ optional `extension/`). No debug port required.
-
-They don't depend on each other. Feature 2 is the actively-developed one and
-the recommended starting point.
 
 ## Prerequisites
 
@@ -33,7 +51,15 @@ the recommended starting point.
 
 ---
 
-## Feature 2: toast + auto-jump for routed tabs (recommended)
+## Features 1 & 2: routed-tab auto-jump and toast+jump (recommended)
+
+Both live in `injected/workspace-route-watcher.js` (detection logic,
+injected into `main.html`) and `injected/window-toast.js` (the toast itself,
+injected into every window's `window.html`) — one install covers both
+features. Which one you get for a given tab depends entirely on how Vivaldi
+routed it, not on any setting: tabs Vivaldi treats as foreground-intent
+(external opens) get Feature 1's automatic jump; everything else Vivaldi
+treats as background (cmd+click, etc.) gets Feature 2's toast.
 
 ### 1. Install the injected scripts
 
@@ -58,10 +84,12 @@ project doesn't hook the update process itself.
 
 ### 2. Install and run the relay
 
-The relay is what lets an external hotkey (or the optional extension) ask
-Vivaldi to jump to the last auto-routed tab, and is also how the injected
-script asks a real OS process to assign a workspace to a brand-new window
-(page JS can't drive System Events itself).
+The relay (`relay/server.js`) is what lets an external hotkey ask Vivaldi to
+jump to the last routed tab (Feature 2, without clicking the toast), and is
+also how the injected script asks a real OS process to assign a workspace to
+a brand-new window — page JS can't drive System Events itself, so both
+features depend on this being up whenever a target workspace needs a
+brand-new window created and assigned.
 
 ```
 cd relay
@@ -88,20 +116,36 @@ launchctl load ~/Library/LaunchAgents/com.aaron.vivaldi-workspace-relay.plist
 
 ### 3. What you get automatically, with nothing further to configure
 
-Once the two steps above are done:
+Once the two steps above are done, both features are live with no further
+setup:
 
-- A tab opened by another app (or pasted URL, etc.) that Vivaldi routes to a
-  different workspace jumps you straight there — creating and assigning a
-  window first if that workspace doesn't have one yet.
-- A tab backgrounded by the user themself (e.g. cmd+click) instead shows a
-  toast naming the destination; click it (or press the hotkey below) to jump.
+- **Feature 1**: a tab opened by another app that Vivaldi routes to a
+  workspace jumps you straight there — creating and assigning a window
+  first if that workspace doesn't have one yet.
+- **Feature 2**: a tab backgrounded by the user themself from inside
+  Vivaldi (cmd+click, or opening a new tab and typing a URL) instead shows a
+  toast naming the destination; click it to jump — again creating and
+  assigning a window first if needed, so nothing already in the current
+  window gets disturbed.
 
-### 4. (Optional) External hotkey for "jump to last routed tab"
+### 4. (Optional) External hotkey for Feature 2's jump, without clicking the toast
 
-Useful for reaching a toast that already disappeared, or for cmd+click
-routes without touching the toast. Pick one — all three just hit the same
-relay endpoint, `GET http://127.0.0.1:8877/jump-last-routed`, so it's fine
-to set up more than one:
+Useful for reaching a toast that already disappeared, or for jumping to a
+background-routed tab without touching it at all. This is external by
+necessity, not by choice: an injected script running inside `window.html`
+*can* listen for keydowns, but only while keyboard focus happens to be on
+Vivaldi's own chrome — a `<webview>` (i.e. the actual page you're looking
+at) runs in a separate process, and its keydowns never reach `window.html`'s
+own `document`. That's a real ceiling confirmed live, not something fixable
+in JS — Vivaldi's own native shortcuts are intercepted at a privileged level
+no injected page script can reach. (An earlier version of this project did
+try an in-page ⌥⌘J listener anyway; it was removed once this external path
+existed and made that partial, focus-dependent coverage fully redundant —
+see the planning doc's 2026-08-09 section.)
+
+Pick one of the options below — all three just hit the same relay endpoint,
+`GET http://127.0.0.1:8877/jump-last-routed`, so it's fine to set up more
+than one:
 
 1. **macOS Shortcuts.app (recommended)** — new shortcut with a single "Get
    Contents of URL" action pointed at
@@ -130,16 +174,27 @@ the History menu.
 ### Debugging
 
 - `vivaldi://inspect/#apps` → **main.html** → inspect, for `[VWH]`-prefixed
-  logs (the watcher/detection logic).
+  logs (the watcher/detection logic, both features).
 - `vivaldi://inspect/#apps` → a specific open window → inspect, for
-  `[VWH-toast]`-prefixed logs (the toast itself).
+  `[VWH-toast]`-prefixed logs (Feature 2's toast itself).
 - `window.__vwh` is exposed at runtime in `main.html`'s console:
   `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`.
 - Relay connection state/errors: `~/Library/Logs/vivaldi-workspace-relay.log`.
 
 ---
 
-## Feature 1: jump-to-workspace hotkeys (CDP-based)
+## Feature 3: jump-to-workspace hotkeys, triggered from outside Vivaldi (CDP-based)
+
+Unlike Features 1 & 2, this isn't reacting to a routed tab — it's a hotkey
+you trigger yourself, for a specific workspace you name in advance, from
+anywhere. Example: bind a global hotkey to `workspace-jump.js "Claude"` so
+you always land in your Claude workspace's window (creating and assigning it
+if it doesn't currently have one) with a single keypress, whether or not it
+happened to already be open.
+
+This works over the Chrome DevTools Protocol rather than injected page JS,
+so it needs Vivaldi running with `--remote-debugging-port` enabled at all
+times.
 
 ### 1. Build and install the debug launcher
 
@@ -183,10 +238,10 @@ want feedback beyond the window switch itself.
 
 ## Uninstalling
 
-- Feature 2: delete the `<script>` tags injected into `main.html`/
+- Features 1 & 2: delete the `<script>` tags injected into `main.html`/
   `window.html` (re-running `install.sh` after removing the source files
   will fail — easiest is to reinstall/repair Vivaldi, or manually edit those
   two HTML files), `launchctl unload` + remove the LaunchAgent plist, remove
   the extension via `vivaldi://extensions` if installed.
-- Feature 1: remove the Keyboard Maestro macros, delete
+- Feature 3: remove the Keyboard Maestro macros, delete
   `/Applications/Vivaldi Debug.app`, go back to launching Vivaldi normally.
