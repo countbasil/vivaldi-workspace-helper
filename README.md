@@ -232,10 +232,13 @@ npm install
 One macro per workspace, each running:
 
 ```
-node /path/to/vivaldi-workspace-helper/bridge/workspace-jump.js "<workspace name>"
+node /path/to/vivaldi-workspace-helper/bridge/workspace-jump.js "Claude"
 ```
 
-bound to whatever hotkey you want for that workspace. First run may prompt
+— replace `Claude` with the actual name of the workspace that macro targets
+(don't leave in any placeholder brackets/angle brackets; the exact string
+here is what gets matched against your real workspace names). Bound to
+whatever hotkey you want for that workspace. First run may prompt
 for Accessibility/Automation permission for Keyboard Maestro Engine to
 control Vivaldi via System Events — allow it once.
 
@@ -275,18 +278,20 @@ in that window gets disturbed. Shows a small "Moved N tab(s) to `<emoji>`
 
 ### Wire up a Keyboard Maestro macro per workspace
 
-One macro per workspace, each bound to a hotkey (e.g. `Ctrl+Shift+<N>`, in
+One macro per workspace, each bound to a hotkey (e.g. `Ctrl+Shift+2`, in
 place of Vivaldi's own broken shortcut for that slot) running:
 
 ```
-curl -s -G --data-urlencode "workspace=<workspace name>" \
+curl -s -G --data-urlencode "workspace=Claude" \
   http://127.0.0.1:8877/move-selected-tabs-to-workspace
 ```
 
-(`--data-urlencode` handles workspace names containing spaces correctly —
-don't just paste the name straight into the URL.) Same mirrored pattern as
-Feature 3's per-workspace macros, just hitting the relay instead of running
-the CDP bridge script.
+— replace `Claude` with the actual name of the workspace that macro targets
+(no placeholder brackets — that's a real, exact workspace name, matched
+literally against what's configured in Vivaldi). `--data-urlencode` handles
+workspace names containing spaces correctly — don't just paste the name
+straight into the URL. Same mirrored pattern as Feature 3's per-workspace
+macros, just hitting the relay instead of running the CDP bridge script.
 
 Response is JSON: `{"ok":true, "windowId":…, "tabCount":…, "workspaceName":…, "created":…}`
 on success, or `{"ok":false, "reason":…}` — `"UNKNOWN_WORKSPACE"` (name
