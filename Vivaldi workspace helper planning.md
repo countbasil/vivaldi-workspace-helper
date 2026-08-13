@@ -1067,21 +1067,26 @@ itself with a random marker in `dataset` the first time it's seen, since
 that marker only survives on the *same* DOM node -- a genuine
 `dismissToast()` + `showToast()` replacement always gets a fresh one.
 
-**Incidental discovery, relevant to Aaron's planned Vivaldi bug report:**
-assigning a workspace to a new window (via the Window-menu click, same
-action `jumpToTab`/`workspace-jump.js` already use) doesn't just make that
-window *display* the workspace -- it physically relocates every tab
-already tagged with that workspace, from wherever they'd been sitting
-(including tabs quietly parked inside an unrelated window, invisible until
-that workspace became displayed there) into the new window. Confirmed live
-across several separate workspaces during testing (each one's pre-existing
-tabs moved into a freshly-created window the first time this project's own
-code assigned it one). This means the earlier mental model in this doc's
-own header comments ("a window can hold tabs from other workspaces too,
-hidden until displayed") was incomplete: those tabs aren't just hidden in
-place indefinitely -- the *first* window to have that workspace assigned to
-it becomes their new home, non-destructively but permanently, until
-reassigned again.
+**Not actually a discovery -- Aaron corrected this (2026-08-13): it's a
+known, fundamental Vivaldi invariant, not a surprising side effect.** A
+workspace can only ever be bound to *one* window at a time, exclusively; all
+tabs tagged with that workspace live together in whichever window currently
+holds the binding. So assigning a workspace to a new window (via the
+Window-menu click, same action `jumpToTab`/`workspace-jump.js` already use)
+doesn't "physically relocate" tabs as some special case -- it's just what
+the one-window-per-workspace binding *is*: the tabs were always going to be
+wherever that binding currently points, and moving the binding moves them
+because there both no other place for them to be and the workspace store
+tracks a single (workspace, window) pair, not a list. Observed live across
+several workspaces during testing (each one's tabs appeared in a
+freshly-created window the moment this project's own code assigned it that
+workspace) -- worth keeping in mind for future work on this project, but not
+new information about Vivaldi, and not something to raise in a bug report.
+(This also means the earlier mental model in this doc's own header comments
+-- "a window can hold tabs from other workspaces too, hidden until
+displayed" -- undersells how exclusive the binding is: it's not merely that
+those tabs are hidden while inactive, it's that the *entire* workspace, not
+just its visibility, belongs to one window at a time.)
 
 **Bug 1 -- total silent drop when the target workspace already has a
 window.** `checkWorkspaceTagThenHandle`'s skip condition (added
