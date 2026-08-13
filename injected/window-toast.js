@@ -14,7 +14,18 @@
 
 (function () {
   const TAG = "[VWH-toast]";
-  const TOAST_DURATION_MS = 8000; // how long the toast stays on screen -- tweak freely
+  // "route" is the only variant you have to actually read and act on before
+  // it goes away, so it gets the long duration. Every other variant is
+  // purely informational -- it's telling you about something that already
+  // happened, not asking you to do anything -- so it doesn't need to
+  // linger; shortened per Aaron's feedback (2026-08-14), especially since
+  // "foreground-switch" fires even for the user's own manual Ctrl+<N>
+  // workspace switch (see onWorkspaceStoreChanged's correlation heuristic,
+  // which can't fully distinguish that from a routed tab's in-place
+  // reassignment), where an 8s lingering toast for your own deliberate
+  // action was actively annoying.
+  const TOAST_DURATION_MS = 8000;
+  const INFORMATIONAL_TOAST_DURATION_MS = 2500;
   // Background opacity, 0 (fully see-through) to 1 (fully solid). Text stays
   // solid either way -- this only affects how much of the page behind shows
   // through the toast's background.
@@ -138,7 +149,7 @@
     document.body.appendChild(el);
     toastEl = el;
 
-    dismissTimer = setTimeout(dismissToast, TOAST_DURATION_MS);
+    dismissTimer = setTimeout(dismissToast, interactive ? TOAST_DURATION_MS : INFORMATIONAL_TOAST_DURATION_MS);
   }
 
   chrome.runtime.onMessage.addListener((message) => {

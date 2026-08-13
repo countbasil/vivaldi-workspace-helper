@@ -397,22 +397,46 @@ planning doc's 2026-08-13 "Feature 4 live-testing" section for the full
 trial-by-trial evidence and the "ghost tab" symptom (content reachable, no
 tab-strip entry at all) this was chasing.
 
-**The "ghost tab" itself turned out to be a separate, simpler bug**: a
-retest with a single never-grouped tab (ruling out stacks) reproduced the
-same symptom, and the screenshot gave it away — `resolveOrCreateWindowForWorkspace`'s
-`chrome.windows.create({})` always gives the new window its own default
-blank/startpage tab, which was never being cleaned up. The destination
-window always had *two* tabs (the leftover default, generically labeled,
-plus the real moved-in one); what looked like a tab with no tab-strip entry
-was actually the leftover default tab sitting there under a confusing
-generic label, not a rendering bug. `resolveOrCreateWindowForWorkspace` now
-captures that default tab's id (`chrome.tabs.query` right after creation —
-the `chrome.windows.create` callback doesn't reliably return a populated
-`tabs` array) and returns it; both callers close it via a new
-`closeDefaultTabIfSafe(windowId, defaultTabId)` helper once their own move
-has landed (guarded to only fire once the window has more than one tab, so
-a failed move never empties/closes the window). See the planning doc's
-"ghost tab" 2026-08-13 section.
+**The leftover-default-tab fix above was real but incomplete** — a retest
+with a single never-grouped tab (ruling out stacks) reproduced the exact
+same symptom afterward, plus a worse detail: Ctrl+Tab could move focus away
+from the ghost tab with no way back. `resolveOrCreateWindowForWorkspace`'s
+`chrome.windows.create({})` does always give the new window a default
+blank/startpage tab that needed cleaning up (now handled via
+`closeDefaultTabIfSafe(windowId, defaultTabId)`, guarded to only fire once
+the window has more than one tab), and that fix stayed — but it wasn't the
+actual cause of the ghost tab.
+
+**Root cause, confirmed live via CDP + screenshots, not guessed**:
+`chrome.tabs.move` to a different window is itself unreliable in this
+Vivaldi build. Moved tabs were confirmed correct at the data level
+(`chrome.windows.get({populate:true})` showed accurate titles, correct
+`active`/`highlighted` state, `groupId:-1`) but permanently absent from the
+tab strip — not a rendering lag; re-activating via the API, waiting, and
+forcing a window resize (layout reflow) all failed to fix it, and Ctrl+Tab
+cycling didn't include the tab either. Fix: a new
+`recreateTabInWindow(tab, windowId, active)` helper that does
+`chrome.tabs.create({windowId, url: tab.url, active, pinned: tab.pinned})`
+followed by `chrome.tabs.remove()` on the original, instead of
+`chrome.tabs.move` — going through Vivaldi's ordinary tab-creation path
+(the one a real Cmd+T uses) sidesteps the bug entirely, confirmed
+repeatedly live including through the real `/move-selected-tabs-to-workspace`
+endpoint end-to-end. Used by both `jumpToTab` and
+`moveSelectedTabsToWorkspace` (each selected tab keeps its own original
+`active` state when recreated, so whichever one was focused stays focused).
+This also obsoletes the `chrome.tabs.ungroup` step from the tab-stacks fix
+above — recreating never touches the original tab's group membership, so
+there's nothing left to ungroup — and the 500ms settle-delay theory,
+which turned out not to be the actual mechanism (kept anyway; harmless and
+still plausibly relevant to the workspace-assignment step itself, just not
+what was causing the ghost tab).
+
+**Deliberate, disclosed trade-off**: recreating a tab loses its own
+back/forward navigation history and any in-page JS state (unsaved form
+input, etc.) — accepted as clearly the lesser cost against a tab that's
+permanently unreachable through any UI interaction. See the README's
+Feature 4 section and the planning doc's 2026-08-13 "chrome.tabs.move
+itself is what's broken" section for the full live-diagnosis trail.
 
 ## Debugging
 

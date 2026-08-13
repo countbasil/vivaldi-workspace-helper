@@ -1393,3 +1393,86 @@ never touches the origin window at all after a successful move.
 Not yet independently re-confirmed live by Claude (Aaron was actively
 testing solo again); reinstalled and pushed based on the evidence and
 screenshot already provided, same pattern as the previous fix round.
+
+### The real cause and fix: chrome.tabs.move itself is what's broken, not a race (2026-08-13, still later)
+
+Aaron restarted, retested with a single plain tab again, and the exact same
+symptom recurred: content visible, no tab-strip entry, and this time an
+additional, worse detail -- pressing Ctrl+Tab moved focus to a *different*
+tab with no way back to the one just moved. The default-tab fix hadn't
+touched the actual bug; it just wasn't the whole story. Aaron gave explicit
+permission for Claude to restart Vivaldi via the debug launcher and
+diagnose live from here (a departure from the last two rounds, where Claude
+deliberately avoided touching Aaron's active session) -- and this is where
+scripted CDP diagnosis earned its keep over guessing from screenshots alone.
+
+Reproduced directly: created a disposable tab, called the real
+`/move-selected-tabs-to-workspace` endpoint targeting a windowless
+workspace ("News"), confirmed the response (`{"ok":true, ...}`), then
+inspected the destination window's *actual* tab data via
+`chrome.windows.get({populate:true})` -- both tabs completely correct: real
+titles ("Example Domain"), `active:true`/`highlighted:true` on the moved
+one, no lingering default tab (that fix *was* working), `groupId:-1`,
+nothing anomalous at the data level at all. Then screenshotted the actual
+window: the tab strip showed exactly one entry ("Blank Page" -- the
+window's other, pre-existing tab), with the moved tab's content on screen
+under no visible tab at all. Confirmed this wasn't a timing issue: waited,
+re-activated the tab via the API (content correctly reappeared, strip still
+showed nothing for it), resized the window by 40px and back to force a
+layout reflow (no change), and reproduced Aaron's own Ctrl+Tab finding
+directly -- cycling landed on "Blank Page" and pressing it again did *not*
+cycle back, even though `chrome.tabs.query` still reported both tabs
+present and correctly ordered. The tab was, by every measure, permanently
+orphaned from Vivaldi's own tab-strip UI -- not a rendering lag, a
+genuine failure to register the tab at all.
+
+One more live experiment settled it: instead of `chrome.tabs.move`,
+recreated the same tab via `chrome.tabs.create({windowId, url, active:true})`
+followed by `chrome.tabs.remove()` on the original. Screenshotted again --
+the new tab appeared in the strip immediately, correctly labeled, correctly
+selected, no ghost. Repeated end-to-end through the real
+`/move-selected-tabs-to-workspace` endpoint (not manual CDP calls) with a
+Wikipedia test tab moved into a freshly-created "Work" window: the strip
+correctly showed all three tabs (two pre-existing real ones plus the new
+one, properly selected), with no leftover default tab either -- both fixes
+working together, confirmed via screenshot.
+
+**Conclusion**: `chrome.tabs.move` to a different window is itself
+unreliable in this Vivaldi build -- not a race against workspace-assignment
+side effects (the earlier 500ms settle-delay theory), and not specific to
+tab stacks (the ungroup fix was real and worth keeping for cleanliness, but
+wasn't the actual cause of the ghost-tab symptom). `chrome.tabs.create`
+followed by `chrome.tabs.remove` on the original goes through Vivaldi's
+ordinary tab-creation path instead -- the same one a real Cmd+T uses, which
+was never in question -- and was confirmed live, repeatedly, to render
+correctly every time in the exact scenario that broke with `move`.
+
+Implementation, in `injected/workspace-route-watcher.js`: new
+`recreateTabInWindow(tab, windowId, active)` helper, used by both
+`jumpToTab` (recreating the single routed tab when it needs to cross into a
+different window) and `moveSelectedTabsToWorkspace` (recreating each
+selected tab in turn, each keeping its own original `active` state so
+whichever one was focused stays focused). The now-unnecessary
+`chrome.tabs.ungroup` step was removed along with it -- recreating never
+touches the original tab's group membership, so there's nothing left to
+ungroup.
+
+**Deliberate, disclosed trade-off**: recreating a tab instead of moving it
+loses that tab's own back/forward navigation history and any in-page JS
+state (unsaved form input, scroll position beyond what the URL itself
+encodes). Accepted as clearly the lesser cost against a tab that's
+permanently unreachable through any UI interaction at all. Documented in
+the README's Feature 4 section.
+
+Also shortened informational toast durations (`INFORMATIONAL_TOAST_DURATION_MS`,
+2500ms vs. the interactive "route" toast's 8000ms) per separate feedback
+from Aaron in the same message: none of the informational variants need to
+stay on screen long enough to click, since none of them are click-required,
+and the "foreground-switch" one in particular was lingering for 8 seconds
+even when triggered by Aaron's own deliberate manual `Ctrl+<N>` workspace
+switch (a known, not-fully-fixable false-positive in
+`onWorkspaceStoreChanged`'s correlation heuristic -- there's no way to
+detect "the user just pressed a native shortcut" from injected page JS, the
+same category of ceiling as the removed in-page ⌥⌘J listener). Shortening
+the duration doesn't eliminate the false trigger, but makes it far less
+disruptive when it happens.

@@ -584,6 +584,34 @@
     }
   }
 
+  // Recreates a tab in the destination window instead of cross-window
+  // moving it there, then closes the original -- returns the new tab's id.
+  // Confirmed live (2026-08-13, with CDP + screenshots, not just reasoning):
+  // a plain chrome.tabs.move to a different window can leave the moved tab
+  // with NO tab-strip entry at all in Vivaldi -- fully functional (content
+  // renders correctly, chrome.tabs.query reports it accurately, activating
+  // it via the API works) but permanently unreachable through any tab-strip
+  // interaction (clicking, Ctrl+Tab cycling), even after a settle delay,
+  // re-activating it, or forcing a window resize to trigger a layout
+  // reflow. Recreating the tab via chrome.tabs.create instead goes through
+  // Vivaldi's ordinary tab-creation path (the same one regular Cmd+T tabs
+  // use, which was never in question), and was confirmed live to render
+  // correctly every time in the same reproduction that broke with `move`.
+  // Deliberate trade-off, not a caveat that slipped through: this loses the
+  // tab's own back/forward history and any in-page JS state (e.g. unsaved
+  // form input) -- real costs, but far smaller than landing a tab you can
+  // never get back to.
+  async function recreateTabInWindow(tab, windowId, active) {
+    const newTab = await callChrome(chrome.tabs, "create", {
+      windowId,
+      url: tab.url,
+      active: !!active,
+      pinned: tab.pinned,
+    });
+    await callChrome(chrome.tabs, "remove", tab.id);
+    return newTab.id;
+  }
+
   // The routed tab is then moved into whichever window that resolves to.
   async function jumpToTab(tabId, workspaceId, workspaceName) {
     try {
@@ -605,14 +633,10 @@
 
       const currentTab = await getTab(tabId);
       if (currentTab && currentTab.windowId !== targetWindowId) {
-        // See moveSelectedTabsToWorkspace's identical ungroup step for why:
-        // a tab still in a stack/group can't reliably cross-window move.
-        if (currentTab.groupId != null && currentTab.groupId !== -1) {
-          await callChrome(chrome.tabs, "ungroup", tabId);
-        }
-        await callChrome(chrome.tabs, "move", tabId, { windowId: targetWindowId, index: -1 });
+        tabId = await recreateTabInWindow(currentTab, targetWindowId, true);
+      } else {
+        await chrome.tabs.update(tabId, { active: true });
       }
-      await chrome.tabs.update(tabId, { active: true });
       await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
 
       return { ok: true, windowId: targetWindowId, tabId, workspaceName, created };
@@ -663,28 +687,19 @@
       const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
 
       if (targetWindowId !== sourceWin.id) {
-        // Chrome's tabs API doesn't reliably support moving a tab that's
-        // still part of a tab stack/group to a different window --
-        // chrome.tabGroups.move only repositions a group *within* the same
-        // window, there's no cross-window equivalent. Confirmed live
-        // (2026-08-13): attempting to move stacked tabs across windows
-        // anyway produced tabs reported as moved that never appeared, and
-        // "ghost" tabs -- content visible once you happened to land on
-        // them, but no tab-strip entry at all. Ungroup first so each tab
-        // moves as a normal standalone tab.
+        // Recreate each selected tab in the destination rather than
+        // cross-window moving it -- see recreateTabInWindow's own comment
+        // for why chrome.tabs.move turned out to be unreliable here (it
+        // also sidesteps a related, now-moot problem: chrome.tabs.move
+        // doesn't reliably support moving a tab still part of a tab
+        // stack/group across windows either, and recreating never touches
+        // the original tab's group membership at all). Each tab keeps its
+        // own original `active` state, so whichever one was already active
+        // ends up the only one active in the new window too.
         for (const tab of selectedTabs) {
-          if (tab.groupId != null && tab.groupId !== -1) {
-            await callChrome(chrome.tabs, "ungroup", tab.id);
-          }
+          await recreateTabInWindow(tab, targetWindowId, tab.active);
         }
-        const tabIds = selectedTabs.map((t) => t.id);
-        await callChrome(chrome.tabs, "move", tabIds, { windowId: targetWindowId, index: -1 });
       }
-      // Keep whichever moved tab was already the active one active in its
-      // new home -- chrome.tabs.move preserves each tab's own active state,
-      // but the window as a whole still needs telling which one to show.
-      const activeMoved = selectedTabs.find((t) => t.active);
-      if (activeMoved) await callChrome(chrome.tabs, "update", activeMoved.id, { active: true });
       await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
 
       return { ok: true, windowId: targetWindowId, tabCount: selectedTabs.length, workspaceName: ws.name, workspaceEmoji: ws.emoji, created };

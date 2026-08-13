@@ -306,18 +306,22 @@ normally happen — the active tab is always at least itself), `"NOT_CONNECTED"`
 (relay is up but nothing's connected from the browser side — reinstall/
 restart Vivaldi), or `"TIMEOUT"`.
 
-**Known limitation — tab stacks.** A selected tab that's part of a Vivaldi
-tab stack/group gets ungrouped as part of the move (there's no Chrome
-extension API for moving a group across windows, only within one) — so it
-arrives at the destination as a standalone tab, not still stacked with its
-former neighbors. Moving a *lot* of stacked tabs to a brand-new window in
-one go may still be less reliable than moving one or two at a time; if a
-move ever reports `"ok":true` but a tab doesn't visibly land anywhere, that
-was empirically the case even after the 2026-08-13 fixes for this exact
-scenario — likely the same underlying Vivaldi flakiness as the broken
-native shortcut this feature works around, not something fixable from the
-extension side. See the planning doc's 2026-08-13 section for the full
-investigation.
+**How a "move" actually works, and what that costs.** Rather than moving a
+tab to its destination window, this closes the original and creates a new
+one there with the same URL. That's not the obvious choice — it's a
+deliberate workaround: Chrome's own cross-window `chrome.tabs.move` turned
+out to be unreliable in this Vivaldi build, confirmed live via CDP —
+"moved" tabs were correct in every API-visible way (title, active state)
+but permanently missing from the tab strip itself, unreachable by clicking
+or Ctrl+Tab, even after waiting or forcing a UI redraw. Recreating the tab
+avoids that bug entirely (going through the same code path a normal Cmd+T
+uses), but it means **a moved tab loses its own back/forward navigation
+history and any unsaved in-page state** (form input, scroll position beyond
+what the URL encodes). A stray tab from a tab stack also arrives at the
+destination as a standalone tab, not still stacked with its former
+neighbors — there's no way to preserve a stack across a window boundary at
+all. See the planning doc's 2026-08-13 sections for the full live-diagnosis
+trail (this took two rounds of fixes to actually nail down).
 
 ---
 
