@@ -512,6 +512,19 @@
       if (!activated.ok) {
         throw new Error("ACTIVATE_FAILED: " + activated.reason);
       }
+      // Settle delay. Assigning a workspace to a window isn't just a label
+      // change -- per the one-window-per-workspace exclusivity (see the top
+      // of this file), Vivaldi itself moves that workspace's own
+      // already-tagged tabs into this window as a side effect, and that
+      // reconciliation is still in flight immediately after the menu click
+      // returns. Racing our own tab move against it produced real breakage
+      // in testing (2026-08-13): tabs reported as moved that never
+      // appeared, and tabs that landed with visible content but no
+      // tab-strip entry at all. Not a guaranteed fix -- likely the same
+      // underlying Vivaldi flakiness as the already-reported "move tab to
+      // workspace" bug -- but gives Vivaldi's own side effect a beat to
+      // finish first.
+      await new Promise((resolve) => setTimeout(resolve, 500));
     } else {
       throw new Error("NO_TARGET_WORKSPACE");
     }
@@ -538,7 +551,12 @@
 
       const currentTab = await getTab(tabId);
       if (currentTab && currentTab.windowId !== targetWindowId) {
-        await new Promise((resolve) => chrome.tabs.move(tabId, { windowId: targetWindowId, index: -1 }, resolve));
+        // See moveSelectedTabsToWorkspace's identical ungroup step for why:
+        // a tab still in a stack/group can't reliably cross-window move.
+        if (currentTab.groupId != null && currentTab.groupId !== -1) {
+          await callChrome(chrome.tabs, "ungroup", tabId);
+        }
+        await callChrome(chrome.tabs, "move", tabId, { windowId: targetWindowId, index: -1 });
       }
       await chrome.tabs.update(tabId, { active: true });
 
@@ -574,6 +592,29 @@
   // in-page trigger for this at all -- it exists specifically to be bound to
   // an external hotkey (e.g. Keyboard Maestro) in place of Vivaldi's own
   // broken shortcut.
+  // Promise wrapper for chrome.* callback APIs that actually checks
+  // chrome.runtime.lastError. Every plain `new Promise((resolve) =>
+  // chrome.foo(..., resolve))` pattern elsewhere in this file silently
+  // swallows API errors -- the callback still fires, so the promise still
+  // resolves, and calling code has no way to tell success from failure.
+  // That turned out to matter a lot for moveSelectedTabsToWorkspace
+  // specifically (confirmed live, 2026-08-13): chrome.tabs.move on a tab
+  // that's part of a tab stack/group can fail outright, but without this,
+  // the failure was invisible -- the function still returned {ok:true} with
+  // a tab that never actually moved.
+  // Takes the owning object and method name separately (chrome.tabs,
+  // "move", ...) rather than a bare function reference -- detaching e.g.
+  // chrome.tabs.move from chrome.tabs and invoking it later loses its
+  // `this` binding, which these APIs rely on internally.
+  function callChrome(obj, method, ...args) {
+    return new Promise((resolve, reject) => {
+      obj[method](...args, (result) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(result);
+      });
+    });
+  }
+
   async function moveSelectedTabsToWorkspace(workspaceName) {
     try {
       const ws = findWorkspaceByName(workspaceName);
@@ -590,14 +631,28 @@
       const { windowId: targetWindowId, created } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
 
       if (targetWindowId !== sourceWin.id) {
+        // Chrome's tabs API doesn't reliably support moving a tab that's
+        // still part of a tab stack/group to a different window --
+        // chrome.tabGroups.move only repositions a group *within* the same
+        // window, there's no cross-window equivalent. Confirmed live
+        // (2026-08-13): attempting to move stacked tabs across windows
+        // anyway produced tabs reported as moved that never appeared, and
+        // "ghost" tabs -- content visible once you happened to land on
+        // them, but no tab-strip entry at all. Ungroup first so each tab
+        // moves as a normal standalone tab.
+        for (const tab of selectedTabs) {
+          if (tab.groupId != null && tab.groupId !== -1) {
+            await callChrome(chrome.tabs, "ungroup", tab.id);
+          }
+        }
         const tabIds = selectedTabs.map((t) => t.id);
-        await new Promise((resolve) => chrome.tabs.move(tabIds, { windowId: targetWindowId, index: -1 }, resolve));
+        await callChrome(chrome.tabs, "move", tabIds, { windowId: targetWindowId, index: -1 });
       }
       // Keep whichever moved tab was already the active one active in its
       // new home -- chrome.tabs.move preserves each tab's own active state,
       // but the window as a whole still needs telling which one to show.
       const activeMoved = selectedTabs.find((t) => t.active);
-      if (activeMoved) await chrome.tabs.update(activeMoved.id, { active: true });
+      if (activeMoved) await callChrome(chrome.tabs, "update", activeMoved.id, { active: true });
 
       return { ok: true, windowId: targetWindowId, tabCount: selectedTabs.length, workspaceName: ws.name, workspaceEmoji: ws.emoji, created };
     } catch (e) {

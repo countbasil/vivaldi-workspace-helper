@@ -276,6 +276,12 @@ none exists yet, exactly like Features 1–3 already do, so nothing already
 in that window gets disturbed. Shows a small "Moved N tab(s) to `<emoji>`
 `<name>`" toast when it's done.
 
+**First use will prompt for an Accessibility/Automation permission** — the
+relay drives Vivaldi's Window menu via System Events (same as Feature 3's
+bridge script) whenever it needs to create and assign a new workspace
+window, so macOS asks you to approve Node controlling System Events/Vivaldi
+the first time that actually happens. Allow it once; it won't ask again.
+
 ### Wire up a Keyboard Maestro macro per workspace
 
 One macro per workspace, each bound to a hotkey (e.g. `Ctrl+Shift+2`, in
@@ -299,6 +305,19 @@ didn't match any configured workspace), `"NO_SELECTED_TABS"` (shouldn't
 normally happen — the active tab is always at least itself), `"NOT_CONNECTED"`
 (relay is up but nothing's connected from the browser side — reinstall/
 restart Vivaldi), or `"TIMEOUT"`.
+
+**Known limitation — tab stacks.** A selected tab that's part of a Vivaldi
+tab stack/group gets ungrouped as part of the move (there's no Chrome
+extension API for moving a group across windows, only within one) — so it
+arrives at the destination as a standalone tab, not still stacked with its
+former neighbors. Moving a *lot* of stacked tabs to a brand-new window in
+one go may still be less reliable than moving one or two at a time; if a
+move ever reports `"ok":true` but a tab doesn't visibly land anywhere, that
+was empirically the case even after the 2026-08-13 fixes for this exact
+scenario — likely the same underlying Vivaldi flakiness as the broken
+native shortcut this feature works around, not something fixable from the
+extension side. See the planning doc's 2026-08-13 section for the full
+investigation.
 
 ---
 

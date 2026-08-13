@@ -378,6 +378,25 @@ to an external hotkey in place of Vivaldi's broken one):
   just hitting the relay instead of running the CDP bridge script — see the
   README's Feature 4 section for the full macro setup.
 
+**Bugs found via Aaron's own live trials, fixed same day**: moving real tab
+stacks surfaced that `{"ok":true}` was being returned for moves that hadn't
+actually happened — every `chrome.*` callback in this path was ignoring
+`chrome.runtime.lastError`, so a failed `chrome.tabs.move` (which Chrome's
+API can do for a still-grouped tab moving cross-window — there's no
+cross-window equivalent of `chrome.tabGroups.move`) silently read as
+success. Fixed with a `callChrome(obj, method, ...args)` helper that
+actually checks `lastError`, used for every write in
+`moveSelectedTabsToWorkspace` and `jumpToTab`'s own tab move; paired with an
+explicit `chrome.tabs.ungroup` step before moving any tab whose `groupId`
+isn't -1. Also added a 500ms settle delay in
+`resolveOrCreateWindowForWorkspace` after a newly-created window's workspace
+assignment returns, before anything touches that window — theory (not yet
+independently re-confirmed live) is a race against Vivaldi's own
+tab-relocation side effect of assigning a workspace to a window; see the
+planning doc's 2026-08-13 "Feature 4 live-testing" section for the full
+trial-by-trial evidence and the "ghost tab" symptom (content reachable, no
+tab-strip entry at all) this was chasing.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or

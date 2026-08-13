@@ -1253,3 +1253,92 @@ create-window path would have hit that mismatch immediately (a spurious
 succeed a moment later) -- bumped to 8000ms, which also quietly fixes the
 same pre-existing latent risk for `/jump-last-routed`'s own create-window
 case.
+
+### Feature 4 live-testing found real bugs: tab stacks, silently-swallowed API errors, a settle race (2026-08-13, later)
+
+Aaron ran a long, methodical series of live trials against the freshly-added
+Feature 4 -- moving real tab stacks of YouTube videos between workspaces,
+deliberately varying conditions (grouped vs. ungrouped tabs, target
+workspace already open vs. not, moving a single stray tab, moving back in
+the reverse direction) and reporting exact JSON responses alongside what
+actually happened on screen. This was all done solo, actively at the
+keyboard -- a different mode from earlier sessions where Claude drove a
+scripted test harness while Aaron was away, and Claude deliberately did not
+run its own live automation against the browser this time since Aaron was
+mid-session with it.
+
+The trials surfaced a consistent, damning pattern: responses reporting
+`{"ok":true, "tabCount":N, ...}` for moves where the tab(s) demonstrably
+did *not* land correctly -- sometimes staying in the original window,
+sometimes disappearing from the tab strip while their *content* remained
+reachable (a "ghost tab": visiting the URL directly, or landing on it via
+Ctrl+J/MRU, showed the page, but there was no corresponding tab-strip entry
+at all, in either "tabs on top" or classic layout), sometimes producing a
+`TIMEOUT` after a long delay with the tab already gone from its origin but
+not present anywhere else identifiable. All of the original tabs were part
+of a tab stack (Vivaldi auto-groups cmd+click-from-a-video-page tabs into
+one, per Aaron's settings).
+
+Root-caused two distinct, compounding bugs in `moveSelectedTabsToWorkspace`
+and the `resolveOrCreateWindowForWorkspace` helper it's built on:
+
+1. **Every `chrome.*` callback in this code path silently swallowed API
+   errors.** The `new Promise((resolve) => chrome.foo(..., resolve))`
+   pattern used throughout this file resolves the promise the moment the
+   callback fires, regardless of whether `chrome.runtime.lastError` was
+   set -- so a failed `chrome.tabs.move` (which is exactly what Chrome's
+   extension API can do for a tab that's still part of a group when you try
+   to move it to a different window; there's no cross-window equivalent of
+   `chrome.tabGroups.move`, which only repositions a group *within* one
+   window) still resolved as if it had succeeded, and the function's own
+   `{ok:true}` was reporting on nothing more than "the callback fired," not
+   "the tab actually moved." This fully explains the `{"ok":true}`-but-
+   nothing-happened trials. Fixed with a new `callChrome(obj, method,
+   ...args)` helper that checks `chrome.runtime.lastError` and rejects if
+   set, used for every write operation in `moveSelectedTabsToWorkspace` and
+   `jumpToTab`'s own tab move.
+2. **Grouped/stacked tabs need ungrouping before a cross-window move.**
+   Confirmed via (1) above that this was a real, distinct failure mode, not
+   just noise: added an explicit `chrome.tabs.ungroup` step (checked via
+   the same `callChrome` helper) for any selected tab whose `groupId` isn't
+   -1, immediately before the `chrome.tabs.move` call. A moved tab now
+   always arrives at its destination as a standalone tab, not still
+   stacked -- there's no API-level way to preserve the stack across a
+   window boundary at all, so this is the correct behavior, not a
+   workaround for a temporary limitation.
+
+A third fix addresses the "ghost tab" pattern specifically (content
+reachable, no tab-strip entry), which persisted even for a single,
+never-grouped tab (the trial with a lone `google.com` tab already sitting
+in the destination workspace): `resolveOrCreateWindowForWorkspace`'s
+create-a-new-window branch now waits 500ms *after* `requestActivateWorkspace`
+returns before the caller is allowed to touch the new window at all. Theory,
+not yet independently re-confirmed via a fresh live trial (Aaron was
+mid-session; Claude fixed based on the evidence already gathered rather than
+resuming its own testing on top of his): assigning a workspace to a window
+isn't just a label change -- per the one-window-per-workspace exclusivity
+documented above, Vivaldi itself moves that workspace's own already-tagged
+tabs into the window as a side effect of the menu click, and that
+reconciliation was still in flight when `moveSelectedTabsToWorkspace`'s own
+`chrome.tabs.move` call raced in immediately afterward. This may turn out to
+be the same underlying class of Vivaldi flakiness as the already-reported
+"move tab to workspace" bug, just triggered from a different angle (a
+freshly-created window rather than a pre-existing one) -- worth watching
+whether Aaron's further testing still finds ghost tabs even with the delay,
+which would point to genuinely irreducible Vivaldi-side flakiness rather
+than a pure timing race fixable from this side.
+
+Separately noted but out of scope for this project entirely -- pure native
+Vivaldi/OS behavior this code never touches: Cmd+W and MRU-tab extensions
+sometimes recall a tab from a window whose workspace got silently replaced;
+removing a tab from a stack via its own UI sometimes doesn't respond at all.
+Both are exactly the kind of flakiness that motivated Aaron's planned bug
+report in the first place, just not this specific one.
+
+Also added to the README per Aaron's report: first use of Feature 4 prompts
+for an Accessibility/Automation permission grant (Node controlling System
+Events/Vivaldi) the first time the relay actually needs to run
+`activateWorkspaceViaMenu` -- previously undocumented, since Feature 3's
+bridge script triggers the equivalent prompt for a different process
+(Keyboard Maestro Engine) and nobody had hit Feature 4's own first-run case
+yet before now.
