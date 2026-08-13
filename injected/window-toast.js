@@ -77,9 +77,11 @@
     // reassigned the *current* window's own workspace in place -- see
     // workspace-route-watcher.js's onWorkspaceStoreChanged), "raised-window"
     // (an existing window already displaying the target workspace was
-    // focused automatically), and "created-window" (no window displayed the
+    // focused automatically), "created-window" (no window displayed the
     // target workspace, so one was created and assigned automatically) --
-    // see handleBackgroundTab's active-tab branch for all three -- are
+    // see handleBackgroundTab's active-tab branch for all three -- and
+    // "moved-tabs" (moveSelectedTabsToWorkspace finished moving the
+    // currently-selected tab(s), triggered externally via the relay) are
     // purely informational: whatever they're telling you about already
     // happened, so clicking just dismisses instead of jumping.
     const variant = message.variant || "route";
@@ -120,6 +122,9 @@
       el.textContent = `Raised window with ${emoji} ${workspaceLabel}`;
     } else if (variant === "created-window") {
       el.textContent = `Created window for ${emoji} ${workspaceLabel}`;
+    } else if (variant === "moved-tabs") {
+      const n = message.tabCount || 1;
+      el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}`;
     } else {
       el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick to switch`;
     }

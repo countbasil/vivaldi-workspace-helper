@@ -15,6 +15,16 @@
 //        -> 503 {ok:false, reason:"NOT_CONNECTED"} if no page is connected
 //        -> 200 with the page's jumpToLastRoutedTab() result otherwise
 //        -> 504 {ok:false, reason:"TIMEOUT"} if the page doesn't reply in time
+//   GET  http://127.0.0.1:<port>/move-selected-tabs-to-workspace?workspace=<name>
+//        -- moves whatever tab(s) are currently selected in Vivaldi's
+//        focused window to the named workspace. Added as a workaround for a
+//        confirmed Vivaldi bug where its own "Move Active Tab to Workspace"
+//        keyboard shortcuts and right-click menu both silently do nothing;
+//        bind this to Ctrl+Shift+<N> via Keyboard Maestro (or similar) in
+//        place of Vivaldi's own broken shortcut. Same response shape as
+//        above, plus {ok:false, reason:"MISSING_WORKSPACE_PARAM"} (400) if
+//        the query param is absent, or {reason:"UNKNOWN_WORKSPACE"} /
+//        {reason:"NO_SELECTED_TABS"} from the page side.
 //
 // Also handles a message *from* the browser side, {type:"activateWorkspace",
 // requestId, workspaceName}: bringing a workspace on screen has no JS API
@@ -28,11 +38,17 @@
 // Env:   VIVALDI_RELAY_PORT (default 8877; must match the injected script's RELAY_PORT)
 
 const http = require("http");
+const { URL } = require("url");
 const { execFile } = require("child_process");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.VIVALDI_RELAY_PORT ? Number(process.env.VIVALDI_RELAY_PORT) : 8877;
-const REQUEST_TIMEOUT_MS = 3000;
+// Must comfortably exceed the injected script's own RELAY_REQUEST_TIMEOUT_MS
+// (5000ms, for its activateWorkspace round-trip back to this same process)
+// plus the window-creation step before that -- otherwise this outer timeout
+// could fire and report failure while the browser side is still genuinely
+// working and about to succeed.
+const REQUEST_TIMEOUT_MS = 8000;
 
 // Same technique as bridge/workspace-jump.js's activateWorkspaceViaMenu --
 // see that file for why this menu click (not the Control-N keystroke) is
@@ -53,7 +69,10 @@ let browserSocket = null;
 let nextRequestId = 1;
 const pending = new Map(); // requestId -> resolve(result)
 
-function handleJumpLastRouted(res) {
+// Shared by every endpoint that forwards a request to the browser side and
+// waits for its response -- handleJumpLastRouted and
+// handleMoveSelectedTabsToWorkspace below just supply the message.
+function sendBrowserRequest(res, message) {
   if (!browserSocket) {
     res.writeHead(503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false, reason: "NOT_CONNECTED" }));
@@ -72,12 +91,29 @@ function handleJumpLastRouted(res) {
     res.end(JSON.stringify(result));
   });
 
-  browserSocket.send(JSON.stringify({ type: "jumpLastRouted", requestId }));
+  browserSocket.send(JSON.stringify(Object.assign({ requestId }, message)));
+}
+
+function handleJumpLastRouted(res) {
+  sendBrowserRequest(res, { type: "jumpLastRouted" });
+}
+
+function handleMoveSelectedTabsToWorkspace(res, workspaceName) {
+  if (!workspaceName) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, reason: "MISSING_WORKSPACE_PARAM" }));
+    return;
+  }
+  sendBrowserRequest(res, { type: "moveSelectedTabsToWorkspace", workspaceName });
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/jump-last-routed") {
+  const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+  if (req.method === "GET" && parsed.pathname === "/jump-last-routed") {
     return handleJumpLastRouted(res);
+  }
+  if (req.method === "GET" && parsed.pathname === "/move-selected-tabs-to-workspace") {
+    return handleMoveSelectedTabsToWorkspace(res, parsed.searchParams.get("workspace"));
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found");

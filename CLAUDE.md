@@ -339,6 +339,45 @@ reliable, migrating the *original* per-workspace jump onto it too (retiring
 CDP/the wrapper app/the debug port entirely) is a natural follow-up, not yet
 done — see the planning doc.
 
+## Third feature: move the current tab(s) to a workspace (2026-08-13, works around a Vivaldi bug)
+
+Confirmed live: Vivaldi's own "Move Active Tab to Workspace N" keyboard
+shortcuts and the tab's right-click → Move → *[workspace]* menu both
+silently no-op — no `vivExtData` change, no window move, nothing —
+reproduced with this project's injected scripts completely removed, so it's
+purely an upstream Vivaldi bug (see the planning doc's 2026-08-13 section
+for the full repro and forum research). `moveSelectedTabsToWorkspace`
+(`injected/workspace-route-watcher.js`) reimplements the action via the
+extension API as a working replacement, reachable only through the relay
+(there's no in-page trigger for this — it exists specifically to be bound
+to an external hotkey in place of Vivaldi's broken one):
+
+- `relay/server.js` — new endpoint, `GET /move-selected-tabs-to-workspace?workspace=<name>`,
+  same request/response plumbing as `/jump-last-routed` (factored out into
+  a shared `sendBrowserRequest` helper). `REQUEST_TIMEOUT_MS` bumped from
+  3000ms to 8000ms while adding this — it was already too short relative to
+  the *injected* script's own 5000ms `RELAY_REQUEST_TIMEOUT_MS` budget for
+  the `activateWorkspace` round-trip when a window needs to be created, a
+  latent bug this new endpoint's "create a window" path would have hit
+  immediately (spurious `TIMEOUT` while the browser side was still working
+  and about to succeed) — applies equally to the pre-existing
+  `/jump-last-routed` endpoint's create-window case.
+- `moveSelectedTabsToWorkspace(workspaceName)` — looks the workspace up by
+  name, reads `chrome.tabs.query({windowId, highlighted:true})` on the
+  currently focused window (this is `true` for the lone active tab when
+  nothing else is multi-selected, and for every tab in a cmd+click
+  multi-selection — so it naturally covers both "move the current tab" and
+  "move several selected tabs" with the same code), resolves/creates the
+  target window via a new shared helper `resolveOrCreateWindowForWorkspace`
+  (extracted from `jumpToTab`, which now calls it too instead of duplicating
+  the window-resolution logic), moves every selected tab there in one
+  `chrome.tabs.move` call, and re-activates whichever one was already
+  active. Shows a `"moved-tabs"` toast (`window-toast.js`) on success:
+  "Moved N tab(s) to `<emoji>` `<name>`".
+- Setup mirrors Feature 3's per-workspace Keyboard Maestro macros exactly,
+  just hitting the relay instead of running the CDP bridge script — see the
+  README's Feature 4 section for the full macro setup.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or

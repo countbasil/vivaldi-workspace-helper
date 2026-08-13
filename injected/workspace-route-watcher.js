@@ -488,28 +488,47 @@
   // some unrelated existing window away from whatever it's currently
   // showing (the exact silent-reassignment problem this whole project
   // exists to avoid -- see the planning doc's "Rejected approach" section).
+  // Shared by jumpToTab and moveSelectedTabsToWorkspace below -- both need
+  // exactly this "find or create the one window for this workspace" step,
+  // just followed by different things (moving one specific tab vs. moving
+  // whatever's currently selected).
+  async function resolveOrCreateWindowForWorkspace(workspaceId, workspaceName) {
+    let targetWindowId = findWindowDisplayingWorkspace(workspaceId);
+    let created = false;
+
+    if (targetWindowId != null) {
+      await chrome.windows.update(targetWindowId, { focused: true });
+    } else if (workspaceName) {
+      const newWin = await new Promise((resolve) => chrome.windows.create({}, resolve));
+      targetWindowId = newWin.id;
+      created = true;
+      windowsCreatedByJumpToTab.add(targetWindowId);
+      setTimeout(() => windowsCreatedByJumpToTab.delete(targetWindowId), 10000);
+      // No extra focus call needed here -- a freshly created window is
+      // already the focused one, and activateWorkspaceViaMenu's own
+      // "tell application Vivaldi to activate" acts on it directly, same
+      // as bridge/workspace-jump.js's own ASSIGNED branch.
+      const activated = await requestActivateWorkspace(workspaceName);
+      if (!activated.ok) {
+        throw new Error("ACTIVATE_FAILED: " + activated.reason);
+      }
+    } else {
+      throw new Error("NO_TARGET_WORKSPACE");
+    }
+
+    return { windowId: targetWindowId, created };
+  }
+
   // The routed tab is then moved into whichever window that resolves to.
   async function jumpToTab(tabId, workspaceId, workspaceName) {
     try {
-      let targetWindowId = findWindowDisplayingWorkspace(workspaceId);
+      let targetWindowId;
       let created = false;
 
-      if (targetWindowId != null) {
-        await chrome.windows.update(targetWindowId, { focused: true });
-      } else if (workspaceName) {
-        const newWin = await new Promise((resolve) => chrome.windows.create({}, resolve));
-        targetWindowId = newWin.id;
-        created = true;
-        windowsCreatedByJumpToTab.add(targetWindowId);
-        setTimeout(() => windowsCreatedByJumpToTab.delete(targetWindowId), 10000);
-        // No extra focus call needed here -- a freshly created window is
-        // already the focused one, and activateWorkspaceViaMenu's own
-        // "tell application Vivaldi to activate" acts on it directly, same
-        // as bridge/workspace-jump.js's own ASSIGNED branch.
-        const activated = await requestActivateWorkspace(workspaceName);
-        if (!activated.ok) {
-          return { ok: false, reason: "ACTIVATE_FAILED: " + activated.reason };
-        }
+      if (workspaceId != null || workspaceName) {
+        const resolved = await resolveOrCreateWindowForWorkspace(workspaceId, workspaceName);
+        targetWindowId = resolved.windowId;
+        created = resolved.created;
       } else {
         const tab = await getTab(tabId);
         targetWindowId = tab ? tab.windowId : null;
@@ -533,6 +552,68 @@
     if (!lastRoutedTab) return { ok: false, reason: "NO_RECENT_ROUTE" };
     const { tabId, workspaceId, workspaceName } = lastRoutedTab;
     return jumpToTab(tabId, workspaceId, workspaceName);
+  }
+
+  function findWorkspaceByName(name) {
+    if (!workspaceStore) return null;
+    const workspaces = workspaceStore.getWorkspaces();
+    return workspaces.find((w) => w.name === name) || null;
+  }
+
+  // Workaround for a Vivaldi bug (confirmed live, both the "Move Active Tab
+  // to Workspace N" keyboard shortcuts and the tab's own right-click "Move"
+  // submenu currently do nothing at all, silently -- reproduces with this
+  // extension completely uninstalled, so it isn't us): moves whatever tab(s)
+  // are currently selected (chrome.tabs' own `highlighted` flag -- true for
+  // the lone active tab when nothing else is multi-selected, true for every
+  // tab in a cmd+click multi-selection) in the focused window to the named
+  // workspace, creating and assigning a window for it first if none exists
+  // yet -- same underlying mechanism as jumpToTab, just operating on
+  // "whatever's selected right now" instead of one specific routed tab.
+  // Reachable only via the relay (see connectRelay below), since there's no
+  // in-page trigger for this at all -- it exists specifically to be bound to
+  // an external hotkey (e.g. Keyboard Maestro) in place of Vivaldi's own
+  // broken shortcut.
+  async function moveSelectedTabsToWorkspace(workspaceName) {
+    try {
+      const ws = findWorkspaceByName(workspaceName);
+      if (!ws) return { ok: false, reason: "UNKNOWN_WORKSPACE" };
+
+      const sourceWin = await new Promise((resolve) => chrome.windows.getLastFocused({}, resolve));
+      if (!sourceWin) return { ok: false, reason: "NO_FOCUSED_WINDOW" };
+
+      const selectedTabs = await new Promise((resolve) =>
+        chrome.tabs.query({ windowId: sourceWin.id, highlighted: true }, resolve)
+      );
+      if (!selectedTabs.length) return { ok: false, reason: "NO_SELECTED_TABS" };
+
+      const { windowId: targetWindowId, created } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
+
+      if (targetWindowId !== sourceWin.id) {
+        const tabIds = selectedTabs.map((t) => t.id);
+        await new Promise((resolve) => chrome.tabs.move(tabIds, { windowId: targetWindowId, index: -1 }, resolve));
+      }
+      // Keep whichever moved tab was already the active one active in its
+      // new home -- chrome.tabs.move preserves each tab's own active state,
+      // but the window as a whole still needs telling which one to show.
+      const activeMoved = selectedTabs.find((t) => t.active);
+      if (activeMoved) await chrome.tabs.update(activeMoved.id, { active: true });
+
+      return { ok: true, windowId: targetWindowId, tabCount: selectedTabs.length, workspaceName: ws.name, workspaceEmoji: ws.emoji, created };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
+  function showMovedTabsToast(result) {
+    chrome.runtime.sendMessage({
+      type: "vwh-show-toast",
+      variant: "moved-tabs",
+      displayWindowId: result.windowId,
+      workspaceName: result.workspaceName,
+      workspaceEmoji: result.workspaceEmoji,
+      tabCount: result.tabCount,
+    });
   }
 
   function requestActivateWorkspace(workspaceName) {
@@ -579,6 +660,12 @@
       if (!msg) return;
       if (msg.type === "jumpLastRouted") {
         const result = await jumpToLastRoutedTab();
+        socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
+        return;
+      }
+      if (msg.type === "moveSelectedTabsToWorkspace") {
+        const result = await moveSelectedTabsToWorkspace(msg.workspaceName);
+        if (result.ok) showMovedTabsToast(result);
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }

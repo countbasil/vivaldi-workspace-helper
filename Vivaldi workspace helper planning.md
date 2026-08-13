@@ -1166,3 +1166,90 @@ reconstruction, not a recovery -- the original tab's content (apparently
 just a bare `google.com` load, nothing workspace-relevant) is gone. Worth
 keeping in mind as a caution for how casually this project's own testing
 tools reach into real browser state.
+
+### Diagnosing a "move tab to workspace" bug, and a Feature 4 workaround (2026-08-13)
+
+Aaron reported, unprompted by any of this project's own changes: much of the
+time, Vivaldi won't let him move a tab to another workspace, via either the
+keyboard shortcut (`Ctrl+Shift+<N>`) or the tab's right-click → Move menu.
+Restarting Vivaldi (both normally and via the debug launcher) didn't fix it.
+He explicitly flagged he might be about to walk away from the computer and
+asked Claude to work it out solo -- a real test of the live-testing
+methodology this project has leaned on throughout, without anyone watching
+to sanity-check each step.
+
+**Investigation.** Checked `Preferences` and `log show` for corruption or
+crashes first -- clean, nothing unusual in the workspace list or link
+routes. Then reproduced live: created a disposable test tab in a fresh
+window, sent the real `Ctrl+Shift+3` shortcut via `osascript`/System Events
+(not a JS API call -- the whole point was testing the actual native path),
+targeting "Tech," a workspace that already had an existing window (to rule
+out a windowless-target-specific explanation). Result: complete no-op -- no
+`vivExtData` change, no window move, nothing. Sanity-checked that the
+automation itself was reaching Vivaldi correctly by sending Cmd+T through
+the identical path and confirming it worked fine, so the failure wasn't an
+artifact of the test method. Then reproduced the same failure through the
+*right-click context menu* specifically, which took real effort: Chromium's
+context menus aren't cleanly exposed as standard `AXMenu`/`AXMenuItem`
+accessibility elements, and pixel-coordinate clicking a submenu proved
+unreliable (a click landed on "Move" but visibly failed to open its
+submenu, confirmed via screenshot). What worked: `perform action
+"AXShowMenu"` on the tab's own accessibility element to open the menu
+non-destructively, then plain arrow-key + Return navigation once it was
+open -- far more robust than coordinates for a menu whose exact pixel
+layout might shift.
+
+**Ruling out this project.** Temporarily reverted `main.html`/`window.html`
+to their pre-`install.sh` originals (the `.vwh.bak` files `install.sh`
+itself creates), fully restarted Vivaldi, and reproduced the identical
+failure with every one of this project's own injected scripts completely
+absent. Restored the patched versions and restarted again afterward. This
+is a genuine upstream Vivaldi bug, not anything caused by
+`workspace-route-watcher.js`/`window-toast.js`.
+
+**Prior art search.** Found two related Vivaldi forum threads --
+[Moving Tab to workspace bug](https://forum.vivaldi.net/topic/115637/moving-tab-to-workspace-bug)
+and [Keyboard shortcut: Move tab to workspace](https://forum.vivaldi.net/topic/95155/keyboard-shortcut-move-tab-to-workspace)
+-- but neither matches: the first describes the move *succeeding* (tab
+visibly changes workspace) but Vivaldi's own window not following/switching
+to show it, a milder and clearly different bug from a complete no-op with
+zero effect. Wrote Aaron a fresh, standalone bug-report writeup (steps to
+reproduce, expected vs. actual, version info) for him to post himself,
+deliberately omitting any mention of this project's own scripts per his
+request -- he already knows independently that this bug predates any of
+this project's changes, and a bug report is clearer without an unrelated
+tangent about a third-party browser extension.
+
+**Feature 4: reimplementing the action ourselves, externally-triggered.**
+Aaron's own suggestion once the bug was confirmed: since Vivaldi's native
+mechanism is broken and this project already has an established
+relay-based path for triggering browser actions from an external hotkey
+(Feature 2's `jump-last-routed` endpoint), add a second endpoint that does
+the same thing Vivaldi's broken shortcut was supposed to -- move whatever
+tab(s) are currently selected to a named workspace -- bindable to
+`Ctrl+Shift+<N>` via Keyboard Maestro in place of the broken native
+shortcut.
+
+Implementation, in `injected/workspace-route-watcher.js`: extracted
+`jumpToTab`'s "find the window for this workspace, or create and assign one
+if none exists" logic into a shared `resolveOrCreateWindowForWorkspace`
+helper (no behavior change for `jumpToTab` itself, just deduplication), then
+built `moveSelectedTabsToWorkspace(workspaceName)` on top of it --
+`chrome.tabs.query({windowId, highlighted:true})` on the focused window
+naturally covers "just the active tab" and "a cmd+click multi-selection"
+with the same code (both read `highlighted:true`), moves them all to the
+resolved target window in one `chrome.tabs.move` call, and shows a new
+`"moved-tabs"` toast. `relay/server.js` gained a matching
+`/move-selected-tabs-to-workspace?workspace=<name>` endpoint, factored
+through a new shared `sendBrowserRequest` helper (also now used by the
+pre-existing `/jump-last-routed`).
+
+Caught one latent bug while wiring this up, not yet triggered in practice
+but real: the relay's outer HTTP `REQUEST_TIMEOUT_MS` was 3000ms, shorter
+than the *injected script's own* 5000ms budget for the `activateWorkspace`
+round-trip it needs when creating a new window. This new endpoint's
+create-window path would have hit that mismatch immediately (a spurious
+`TIMEOUT` response while the browser side was still working and about to
+succeed a moment later) -- bumped to 8000ms, which also quietly fixes the
+same pre-existing latent risk for `/jump-last-routed`'s own create-window
+case.

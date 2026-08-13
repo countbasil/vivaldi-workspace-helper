@@ -29,11 +29,21 @@ the right workspace window without that happening":
   e.g. a global hotkey that always takes you to wherever your Claude
   conversations are routed, whenever you want to use Claude, regardless of
   whether that window already happens to be open.
+- **Feature 4 — move the current tab(s) to a named workspace, triggered from
+  outside Vivaldi.** A workaround for a confirmed Vivaldi bug (still present
+  as of 8.1.4087.64): its own "Move Active Tab to Workspace" keyboard
+  shortcuts and the tab's right-click → Move → *[workspace]* menu both
+  silently do nothing at all. This reimplements that action from outside
+  Vivaldi — bind `Ctrl+Shift+<N>` (or whatever) via Keyboard Maestro to move
+  whatever tab(s) are currently selected to a named workspace, creating and
+  assigning a window for it first if none exists yet.
 
 Features 1 and 2 are two branches of the same underlying detection code and
-share one install step. Feature 3 is a separate, older mechanism (CDP
-instead of injected page JS) with its own install step. All three can be
-installed independently of each other.
+share one install step. Feature 4 reuses that same install (just a different
+relay endpoint) — see its own section below for the Keyboard Maestro setup.
+Feature 3 is a separate, older mechanism (CDP instead of injected page JS)
+with its own install step. All four can be installed independently of each
+other.
 
 For the full design rationale (including a rejected first approach and every
 bug found along the way), see
@@ -236,12 +246,64 @@ want feedback beyond the window switch itself.
 
 ---
 
+## Feature 4: move the current tab(s) to a named workspace (works around a Vivaldi bug)
+
+Confirmed live (2026-08-13): Vivaldi's own "Move Active Tab to Workspace N"
+keyboard shortcuts (`Ctrl+Shift+0`–`9` by default) and the tab's right-click
+→ **Move** → *[workspace name]* menu both silently do nothing — no error, no
+tab movement, no indication anything was attempted. Reproduced with this
+project's own scripts completely uninstalled, so it isn't caused by
+anything here; it's an upstream Vivaldi bug (see the planning doc's
+2026-08-13 section for the full repro, and consider filing/upvoting a bug
+report on the [Vivaldi forum](https://forum.vivaldi.net/)). This feature
+reimplements the action ourselves via the extension API, triggered
+externally, as a working replacement.
+
+Needs the same install as Features 1 & 2 above (`injected/install.sh` +
+the relay) — nothing extra to install, just a different relay endpoint:
+
+```
+GET http://127.0.0.1:8877/move-selected-tabs-to-workspace?workspace=<name>
+```
+
+Moves whatever tab(s) are currently selected (the active tab, or a
+cmd+click multi-selection across several tabs) in Vivaldi's focused window
+to the named workspace — creating and assigning a window for it first if
+none exists yet, exactly like Features 1–3 already do, so nothing already
+in that window gets disturbed. Shows a small "Moved N tab(s) to `<emoji>`
+`<name>`" toast when it's done.
+
+### Wire up a Keyboard Maestro macro per workspace
+
+One macro per workspace, each bound to a hotkey (e.g. `Ctrl+Shift+<N>`, in
+place of Vivaldi's own broken shortcut for that slot) running:
+
+```
+curl -s -G --data-urlencode "workspace=<workspace name>" \
+  http://127.0.0.1:8877/move-selected-tabs-to-workspace
+```
+
+(`--data-urlencode` handles workspace names containing spaces correctly —
+don't just paste the name straight into the URL.) Same mirrored pattern as
+Feature 3's per-workspace macros, just hitting the relay instead of running
+the CDP bridge script.
+
+Response is JSON: `{"ok":true, "windowId":…, "tabCount":…, "workspaceName":…, "created":…}`
+on success, or `{"ok":false, "reason":…}` — `"UNKNOWN_WORKSPACE"` (name
+didn't match any configured workspace), `"NO_SELECTED_TABS"` (shouldn't
+normally happen — the active tab is always at least itself), `"NOT_CONNECTED"`
+(relay is up but nothing's connected from the browser side — reinstall/
+restart Vivaldi), or `"TIMEOUT"`.
+
+---
+
 ## Uninstalling
 
-- Features 1 & 2: delete the `<script>` tags injected into `main.html`/
+- Features 1, 2 & 4: delete the `<script>` tags injected into `main.html`/
   `window.html` (re-running `install.sh` after removing the source files
   will fail — easiest is to reinstall/repair Vivaldi, or manually edit those
   two HTML files), `launchctl unload` + remove the LaunchAgent plist, remove
-  the extension via `vivaldi://extensions` if installed.
+  the extension via `vivaldi://extensions` if installed, remove any Feature 4
+  Keyboard Maestro macros.
 - Feature 3: remove the Keyboard Maestro macros, delete
   `/Applications/Vivaldi Debug.app`, go back to launching Vivaldi normally.
