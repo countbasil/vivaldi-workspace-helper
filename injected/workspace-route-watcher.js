@@ -368,6 +368,25 @@
     if (findWindowDisplayingWorkspace(ws.id) === tab.windowId) return; // already correctly displayed
     chrome.windows.getLastFocused({}, (focusedWin) => {
       const displayWindowId = focusedWin ? focusedWin.id : null;
+      // This skip exists ONLY for background (cmd+click) tabs -- see the big
+      // comment below for why. Foreground-intent tabs (wasOriginallyActive)
+      // must never defer here: handleBackgroundTab's own jumpToTab call now
+      // resolves the correct outcome deterministically every time (raise an
+      // existing window, or create one), regardless of whether Vivaldi ever
+      // does a native in-place reassignment at all -- and when the target
+      // workspace already has a window elsewhere, jumpToTab just focuses it
+      // without ever touching the workspace store, so onWorkspaceStoreChanged
+      // would never fire to pick up the slack. Confirmed live (2026-08-12):
+      // deferring foreground-intent tabs here caused a total silent drop --
+      // no toast, no jump, tab left sitting wherever it was created -- for
+      // exactly that "target already has a window" case, reproduced via a
+      // scripted repeated-test harness (see the planning doc's 2026-08-12
+      // section).
+      const wasOriginallyActive = tabOriginalActiveState.has(tab.id) ? tabOriginalActiveState.get(tab.id) : tab.active;
+      if (wasOriginallyActive) {
+        handleBackgroundTab(tab, displayWindowId);
+        return;
+      }
       // Only skip if onWorkspaceStoreChanged's own correlation will actually
       // catch this tab -- i.e. it's sitting in the focused window *and* it's
       // the specific active:true tab that path is watching for there. A
@@ -410,6 +429,20 @@
   const FOREGROUND_TAB_CORRELATION_MS = 3000;
   const recentActiveTabWindows = new Map(); // windowId -> tabId
 
+  // windowIds jumpToTab itself just created (see jumpToTab below). A brand
+  // new window's own default tab is created active:true, which satisfies
+  // recentActiveTabWindows' correlation just as well as a genuine routed
+  // tab would -- so without this, jumpToTab assigning a workspace to a
+  // window it just created (the "no window existed yet" branch) reads to
+  // onWorkspaceStoreChanged as indistinguishable from Vivaldi natively
+  // reassigning some *other*, pre-existing foreground window in place.
+  // Confirmed live (2026-08-12): this produced a second, spurious
+  // "foreground-switch" toast moments after jumpToTab's own correct
+  // "created-window" toast, silently overwriting it (window-toast.js
+  // replaces whatever's showing on each new message) -- see the planning
+  // doc's 2026-08-12 section.
+  const windowsCreatedByJumpToTab = new Set();
+
   let lastKnownFocusedWorkspaceId; // undefined until first computed in init()
 
   function refreshFocusedWorkspaceBaseline() {
@@ -423,6 +456,14 @@
       if (!focusedWin) return;
       const newWsId = findWorkspaceIdForWindow(focusedWin.id);
       const recentTabId = recentActiveTabWindows.get(focusedWin.id);
+      if (windowsCreatedByJumpToTab.has(focusedWin.id)) {
+        // This store change is jumpToTab assigning a workspace to a window
+        // it just created itself -- not a native Vivaldi reassignment.
+        // jumpToTab already shows its own correct toast for this; don't
+        // also fire ours on top of it.
+        lastKnownFocusedWorkspaceId = newWsId;
+        return;
+      }
       if (newWsId != null && newWsId !== lastKnownFocusedWorkspaceId && recentTabId != null) {
         recentActiveTabWindows.delete(focusedWin.id);
         const ws = workspaceStore.getWorkspaceById(newWsId);
@@ -459,6 +500,8 @@
         const newWin = await new Promise((resolve) => chrome.windows.create({}, resolve));
         targetWindowId = newWin.id;
         created = true;
+        windowsCreatedByJumpToTab.add(targetWindowId);
+        setTimeout(() => windowsCreatedByJumpToTab.delete(targetWindowId), 10000);
         // No extra focus call needed here -- a freshly created window is
         // already the focused one, and activateWorkspaceViaMenu's own
         // "tell application Vivaldi to activate" acts on it directly, same

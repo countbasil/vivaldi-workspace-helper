@@ -1020,3 +1020,144 @@ toast -- Aaron's request was specifically about external-app opens, and an
 automatic, un-asked-for window jump for a tab the user opened *without*
 foreground intent would be a real regression (surprising a user who
 deliberately opened something in the background).
+
+### Reorganizing the README around three features, and a scripted live-testing session that found two real races (2026-08-12)
+
+Aaron asked for the README reorganized around how *he* actually thinks about
+this project -- three features, not two: (1) automatic jump for
+externally-opened routed tabs, (2) toast + click-to-jump (or external
+hotkey) for tabs routed from inside Vivaldi (cmd+click, or a new tab typed
+into), (3) the CDP-based jump-to-named-workspace hotkey. Done in
+`README.md`, including spelling out *why* feature 2's click-free jump has to
+go through an external hotkey rather than in-page JS (the `<webview>`
+focus-boundary ceiling documented above under "⌥⌘J's real ceiling").
+
+While reviewing that reorg, a side comment surfaced a real question: does
+typing a URL into a *fresh, blank* Cmd+T tab actually get routed at all,
+given the 2026-08-08 finding that "Vivaldi doesn't apply workspace rules to
+in-place navigation"? Aaron confirmed live experience: it behaves
+differently for a blank tab than for retyping over an already-loaded page --
+and described exactly the kind of inconsistent results ("usually correct,
+but sometimes toasts the wrong thing, and sometimes stops toasting
+altogether if I keep running tests") that this project's whole history has
+been built on chasing down. He suggested scripting a repeatable test matrix
+rather than continuing to rely on manual, hard-to-reproduce trials, and
+offered that the results might also be useful for a Vivaldi bug report about
+tabs going invisible when a window's workspace is silently reassigned.
+
+**Methodology.** Rather than fragile fake-keystroke UI automation, the test
+harness (`vwh-test-harness.js`, `stress-test.js` -- scratchpad, not checked
+in) drove Vivaldi directly over the existing CDP connection (same technique
+as `bridge/workspace-jump.js`): `chrome.windows.create`/`chrome.tabs.create`
+to open a window with a Google tab, then `chrome.tabs.create` (blank,
+active) followed by `chrome.tabs.update` to a target URL a beat later --
+faithfully reproducing the real two-step "Cmd+T, then type a URL" shape
+(tab exists before the URL does) that a one-shot `chrome.tabs.create({url})`
+would not. Results were read two ways: `[VWH]`/`[VWH-toast]` console lines
+captured live via CDP `Runtime.consoleAPICalled`, and -- more reliably --
+the actual `#vwh-toast` DOM element's text, polled every 250ms across every
+open window (including ones created mid-test). The DOM poll needed two
+iterations to get right: text-diffing alone missed a real re-fire whose
+text happened to match what was already showing (e.g. "Raised window with
+Work" twice in a row reads as "no change"), and object-identity-diffing via
+CDP's `objectId` was *also* unreliable, since CDP mints a fresh remote
+handle on every single `Runtime.evaluate` call regardless of whether the
+underlying DOM node persisted. What actually worked: tagging the element
+itself with a random marker in `dataset` the first time it's seen, since
+that marker only survives on the *same* DOM node -- a genuine
+`dismissToast()` + `showToast()` replacement always gets a fresh one.
+
+**Incidental discovery, relevant to Aaron's planned Vivaldi bug report:**
+assigning a workspace to a new window (via the Window-menu click, same
+action `jumpToTab`/`workspace-jump.js` already use) doesn't just make that
+window *display* the workspace -- it physically relocates every tab
+already tagged with that workspace, from wherever they'd been sitting
+(including tabs quietly parked inside an unrelated window, invisible until
+that workspace became displayed there) into the new window. Confirmed live
+across several separate workspaces during testing (each one's pre-existing
+tabs moved into a freshly-created window the first time this project's own
+code assigned it one). This means the earlier mental model in this doc's
+own header comments ("a window can hold tabs from other workspaces too,
+hidden until displayed") was incomplete: those tabs aren't just hidden in
+place indefinitely -- the *first* window to have that workspace assigned to
+it becomes their new home, non-destructively but permanently, until
+reassigned again.
+
+**Bug 1 -- total silent drop when the target workspace already has a
+window.** `checkWorkspaceTagThenHandle`'s skip condition (added
+2026-08-08, see "⌥¬J's real ceiling" era fix above) was written for a world
+where the foreground-intent branch only ever *passively* waited for either
+Vivaldi's own native in-place reassignment or fell back to a click-to-jump
+toast -- so deferring to `onWorkspaceStoreChanged` "just in case" was
+harmless. That stopped being true on 2026-08-10, when the foreground-intent
+branch started calling `jumpToTab` directly and unconditionally. Reproduced
+live via `stress-test.js`: repeated iterations against the same
+already-windowed target workspace showed the toast correctly firing once,
+then going completely silent on a later iteration with no toast, no log
+line, and (checked directly) no tab movement at all -- the routed tab was
+simply abandoned wherever it happened to be created. Root cause: the skip
+condition doesn't verify that `onWorkspaceStoreChanged` will actually fire
+for this tab -- it only checks "was a tab just made active in the currently
+focused window," which is true for essentially every foreground-intent
+routed tab, not just ones genuinely headed for a native in-place
+reassignment. When the target workspace already has a window elsewhere,
+`jumpToTab`'s correct action (just focus that window) never touches the
+workspace store at all -- so `onWorkspaceStoreChanged` was never going to
+fire, and the skip left nothing to catch the tab.
+
+**Bug 2 -- a spurious duplicate toast overwriting the correct one.**
+Reproduced live via the toast-DOM trace: `jumpToTab`'s "create window"
+branch correctly showed `"Created window for 🤓 Tech"`, but ~870ms later a
+second, informational `"foreground-switch"` toast fired for the same
+window and silently replaced it (`window-toast.js`'s `showToast` always
+calls `dismissToast()` first). Root cause: `chrome.windows.create({})`
+gives the new window a default blank tab, created `active: true` -- which
+satisfies `onWorkspaceStoreChanged`'s `recentActiveTabWindows` correlation
+just as well as a genuine routed tab would. Moments later, `jumpToTab`
+assigns the target workspace to that same new window (via
+`requestActivateWorkspace`), which is a real workspace-store change --
+`onWorkspaceStoreChanged` can't tell that change apart from Vivaldi natively
+reassigning some pre-existing foreground window, so it fires its own
+(wrong, and now duplicate) toast on top of `jumpToTab`'s already-correct
+one.
+
+**Fix**, in `injected/workspace-route-watcher.js`:
+- `checkWorkspaceTagThenHandle` now looks up `wasOriginallyActive` (the same
+  lookup `handleBackgroundTab` already does) and, for foreground-intent
+  tabs, calls `handleBackgroundTab` directly every time rather than ever
+  deferring -- `jumpToTab` resolves the correct outcome deterministically
+  regardless of what Vivaldi natively does, so there's nothing left to wait
+  for. The original skip is kept, unchanged, for background (cmd+click)
+  tabs, where the underlying 2026-08-08 regression it was fixing (a
+  windowless-target background tab also never leaving the focused window)
+  is still real.
+- A new `windowsCreatedByJumpToTab` set (bounded cleanup, same pattern as
+  `recentlyHandledTabIds`) is populated the instant `jumpToTab` creates a
+  window, and checked by `onWorkspaceStoreChanged` before it fires anything
+  -- a store change on a window we just created ourselves is `jumpToTab`
+  finishing its own job, not a native reassignment to report on.
+
+**Verification.** Re-ran the same `stress-test.js` matrix post-fix (4
+consecutive iterations against an already-windowed target): every iteration
+now produces exactly one correctly-worded toast, no silent drops, no
+duplicates -- confirmed via the corrected DOM-marker trace. The "create new
+window" path (Bug 2) was directly reproduced and root-caused pre-fix but not
+re-triggered live post-fix, since doing so again would have required
+disrupting more of Aaron's real, already-correctly-relocated workspace tabs
+without a fresh windowless-but-routable target left to test against
+safely -- confidence there rests on the fix directly targeting the
+confirmed mechanism (the new window's default tab's false correlation),
+not on a second live repro.
+
+**One accounting gap, disclosed rather than papered over:** a single
+pre-existing tab (a `google.com` tab tagged to the Claude workspace, present
+in the very first state snapshot taken before any testing began) could not
+be found in the final state, and its loss can't be pinpointed to a specific
+step among everything that happened across this session (repeated
+window/tab creation and removal, plus a full Vivaldi restart to load the
+fix). A fresh window was created and assigned to Claude workspace with
+claude.ai loaded, to leave that workspace in a sane state, but this is a
+reconstruction, not a recovery -- the original tab's content (apparently
+just a bare `google.com` load, nothing workspace-relevant) is gone. Worth
+keeping in mind as a caution for how casually this project's own testing
+tools reach into real browser state.

@@ -120,7 +120,11 @@ on screen (`window.html`, one instance per open window):
   origin), so it hit that skip too and then had no path left to notify
   through at all — a silent, total drop, confirmed live after closing a
   window this feature had created and cmd+clicking back to that same
-  now-windowless workspace.
+  now-windowless workspace. **As of 2026-08-12, this skip only ever applies
+  to background (`wasOriginallyActive === false`) tabs** — see the
+  "Externally-opened routes jump automatically" note below for why
+  foreground-intent tabs now bypass it entirely, and for a second,
+  independent race this same fourth path caused once that change landed.
 
   A fifth case, layered on top of the first three rather than a separate
   detection path: an externally-opened tab that lands in an *existing*
@@ -136,8 +140,13 @@ on screen (`window.html`, one instance per open window):
   `onCreated`, captured before any move can touch it) is the fix; `active`
   read anywhere later is unreliable. This same signal is what distinguishes
   cmd+click (`active: false`, always) from external opens, confirmed
-  empirically; address-bar entry doesn't even create a new tab (navigates
-  in place), so it never reaches any of this code at all.
+  empirically. Address-bar entry into an *already-loaded* tab doesn't create
+  a new tab and doesn't get routed at all (navigates in place, confirmed
+  live) — but typing a URL into a **fresh, blank** Cmd+T tab is different
+  and *does* get routed (confirmed live 2026-08-12): the tab already exists
+  (from Cmd+T) but starts blank, so it's indistinguishable from a genuine
+  external open by every signal available here (`active: true` at creation,
+  no `openerTabId`) — it hits the exact same foreground-intent code path.
 
   **Externally-opened routes jump automatically (changed 2026-08-10, see the
   planning doc's 2026-08-10 section for the full history)**: rather than
@@ -168,6 +177,43 @@ on screen (`window.html`, one instance per open window):
   (`wasOriginallyActive === false`) are unchanged — still the interactive
   click-to-jump toast, since an unrequested automatic jump for a
   deliberately-backgrounded tab would be a real regression, not a fix.
+
+  **Two races fixed 2026-08-12** (found via a scripted, repeatable live-test
+  harness — see the planning doc's 2026-08-12 section for full methodology
+  and evidence): making the foreground-intent branch call `jumpToTab`
+  directly and unconditionally (above) broke an assumption the *existing*
+  fourth-case logic depended on, in two different ways.
+  1. **Total silent drop.** `checkWorkspaceTagThenHandle`'s skip (see the
+     fourth-case comment above) was written back when the foreground-intent
+     branch only ever passively waited for a possible native reassignment —
+     deferring "just in case" was harmless. Once that branch started acting
+     deterministically via `jumpToTab`, deferring stopped being safe: when
+     the target workspace already has a window elsewhere, `jumpToTab` just
+     focuses it without ever touching the workspace store, so
+     `onWorkspaceStoreChanged` was never going to fire and pick up the
+     slack — the routed tab was silently abandoned wherever it had been
+     created, no toast, no jump, no log line. Reproduced live via repeated
+     scripted trials against the same already-windowed target. Fixed by
+     having `checkWorkspaceTagThenHandle` call `handleBackgroundTab`
+     directly for foreground-intent tabs every time, never deferring — the
+     skip now only ever applies to background tabs, where the scenario it
+     was originally added for is still real.
+  2. **Spurious duplicate toast.** `jumpToTab`'s "create window" branch
+     (`chrome.windows.create({})`) gives the new window a default blank tab,
+     itself created `active: true` — satisfying `onWorkspaceStoreChanged`'s
+     own `recentActiveTabWindows` correlation just as well as a genuine
+     routed tab would. When `jumpToTab` then assigns the target workspace to
+     that same window moments later, `onWorkspaceStoreChanged` can't tell
+     that apart from a native in-place reassignment, and fires its own
+     (wrong, and duplicate) `"foreground-switch"` toast on top of
+     `jumpToTab`'s already-correct `"created-window"` one — confirmed live,
+     `window-toast.js` always calls `dismissToast()` before showing a new
+     one, so the second silently overwrote the first. Fixed with a new
+     `windowsCreatedByJumpToTab` set (bounded cleanup, same pattern as
+     `recentlyHandledTabIds`), populated the instant `jumpToTab` creates a
+     window and checked by `onWorkspaceStoreChanged` before it fires
+     anything — a store change on a window we just created ourselves is
+     `jumpToTab` finishing its own job, not something to report on.
 - `injected/window-toast.js` — plain JS injected into `window.html` (the
   visible per-window chrome document; every open window loads its own
   instance of the same file), also via `injected/install.sh`. Listens for
