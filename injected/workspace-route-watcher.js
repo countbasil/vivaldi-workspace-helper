@@ -482,6 +482,29 @@
 
   // ---------- jump action (shared by toast click, in-toast keybind, and relay) ----------
   //
+  // Promise wrapper for chrome.* callback APIs that actually checks
+  // chrome.runtime.lastError. Every plain `new Promise((resolve) =>
+  // chrome.foo(..., resolve))` pattern elsewhere in this file silently
+  // swallows API errors -- the callback still fires, so the promise still
+  // resolves, and calling code has no way to tell success from failure.
+  // That turned out to matter a lot for moveSelectedTabsToWorkspace
+  // specifically (confirmed live, 2026-08-13): chrome.tabs.move on a tab
+  // that's part of a tab stack/group can fail outright, but without this,
+  // the failure was invisible -- the function still returned {ok:true} with
+  // a tab that never actually moved. Takes the owning object and method
+  // name separately (chrome.tabs, "move", ...) rather than a bare function
+  // reference -- detaching e.g. chrome.tabs.move from chrome.tabs and
+  // invoking it later loses its `this` binding, which these APIs rely on
+  // internally.
+  function callChrome(obj, method, ...args) {
+    return new Promise((resolve, reject) => {
+      obj[method](...args, (result) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else resolve(result);
+      });
+    });
+  }
+
   // Mirrors bridge/workspace-jump.js's own two-branch decision exactly:
   // if the workspace already has a window, focus *that* one; if not, create
   // a brand-new blank window and assign it, rather than force-switching
@@ -495,6 +518,18 @@
   async function resolveOrCreateWindowForWorkspace(workspaceId, workspaceName) {
     let targetWindowId = findWindowDisplayingWorkspace(workspaceId);
     let created = false;
+    // Set only when we create a brand-new window: its own default blank/
+    // startpage tab, which chrome.windows.create({}) always adds and which
+    // is never otherwise cleaned up. Left in place, the destination window
+    // ends up with two tabs -- the real moved one, plus this placeholder --
+    // which turned out to be the actual explanation for the "no tab
+    // indicator" reports during testing (2026-08-13): what looked like a
+    // moved tab arriving with no tab-strip entry was this leftover default
+    // tab sitting there generically labeled, while the real moved tab (with
+    // its own real title) was the one actually missing/misrendered. Callers
+    // close this once their own move has landed -- see jumpToTab and
+    // moveSelectedTabsToWorkspace below.
+    let defaultTabId = null;
 
     if (targetWindowId != null) {
       await chrome.windows.update(targetWindowId, { focused: true });
@@ -504,6 +539,8 @@
       created = true;
       windowsCreatedByJumpToTab.add(targetWindowId);
       setTimeout(() => windowsCreatedByJumpToTab.delete(targetWindowId), 10000);
+      const defaultTabs = await new Promise((resolve) => chrome.tabs.query({ windowId: targetWindowId }, resolve));
+      if (defaultTabs.length === 1) defaultTabId = defaultTabs[0].id;
       // No extra focus call needed here -- a freshly created window is
       // already the focused one, and activateWorkspaceViaMenu's own
       // "tell application Vivaldi to activate" acts on it directly, same
@@ -529,7 +566,22 @@
       throw new Error("NO_TARGET_WORKSPACE");
     }
 
-    return { windowId: targetWindowId, created };
+    return { windowId: targetWindowId, created, defaultTabId };
+  }
+
+  // Closes the destination window's own leftover default tab (see
+  // resolveOrCreateWindowForWorkspace) -- but only once it's no longer the
+  // window's only tab, so a failed move never leaves the window empty/closed.
+  async function closeDefaultTabIfSafe(windowId, defaultTabId) {
+    if (defaultTabId == null) return;
+    try {
+      const tabs = await new Promise((resolve) => chrome.tabs.query({ windowId }, resolve));
+      if (tabs.length > 1 && tabs.some((t) => t.id === defaultTabId)) {
+        await callChrome(chrome.tabs, "remove", defaultTabId);
+      }
+    } catch (e) {
+      console.warn(TAG, "closeDefaultTabIfSafe failed:", e);
+    }
   }
 
   // The routed tab is then moved into whichever window that resolves to.
@@ -537,11 +589,13 @@
     try {
       let targetWindowId;
       let created = false;
+      let defaultTabId = null;
 
       if (workspaceId != null || workspaceName) {
         const resolved = await resolveOrCreateWindowForWorkspace(workspaceId, workspaceName);
         targetWindowId = resolved.windowId;
         created = resolved.created;
+        defaultTabId = resolved.defaultTabId;
       } else {
         const tab = await getTab(tabId);
         targetWindowId = tab ? tab.windowId : null;
@@ -559,6 +613,7 @@
         await callChrome(chrome.tabs, "move", tabId, { windowId: targetWindowId, index: -1 });
       }
       await chrome.tabs.update(tabId, { active: true });
+      await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
 
       return { ok: true, windowId: targetWindowId, tabId, workspaceName, created };
     } catch (e) {
@@ -592,29 +647,6 @@
   // in-page trigger for this at all -- it exists specifically to be bound to
   // an external hotkey (e.g. Keyboard Maestro) in place of Vivaldi's own
   // broken shortcut.
-  // Promise wrapper for chrome.* callback APIs that actually checks
-  // chrome.runtime.lastError. Every plain `new Promise((resolve) =>
-  // chrome.foo(..., resolve))` pattern elsewhere in this file silently
-  // swallows API errors -- the callback still fires, so the promise still
-  // resolves, and calling code has no way to tell success from failure.
-  // That turned out to matter a lot for moveSelectedTabsToWorkspace
-  // specifically (confirmed live, 2026-08-13): chrome.tabs.move on a tab
-  // that's part of a tab stack/group can fail outright, but without this,
-  // the failure was invisible -- the function still returned {ok:true} with
-  // a tab that never actually moved.
-  // Takes the owning object and method name separately (chrome.tabs,
-  // "move", ...) rather than a bare function reference -- detaching e.g.
-  // chrome.tabs.move from chrome.tabs and invoking it later loses its
-  // `this` binding, which these APIs rely on internally.
-  function callChrome(obj, method, ...args) {
-    return new Promise((resolve, reject) => {
-      obj[method](...args, (result) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else resolve(result);
-      });
-    });
-  }
-
   async function moveSelectedTabsToWorkspace(workspaceName) {
     try {
       const ws = findWorkspaceByName(workspaceName);
@@ -628,7 +660,7 @@
       );
       if (!selectedTabs.length) return { ok: false, reason: "NO_SELECTED_TABS" };
 
-      const { windowId: targetWindowId, created } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
+      const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
 
       if (targetWindowId !== sourceWin.id) {
         // Chrome's tabs API doesn't reliably support moving a tab that's
@@ -653,6 +685,7 @@
       // but the window as a whole still needs telling which one to show.
       const activeMoved = selectedTabs.find((t) => t.active);
       if (activeMoved) await callChrome(chrome.tabs, "update", activeMoved.id, { active: true });
+      await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
 
       return { ok: true, windowId: targetWindowId, tabCount: selectedTabs.length, workspaceName: ws.name, workspaceEmoji: ws.emoji, created };
     } catch (e) {

@@ -397,6 +397,23 @@ planning doc's 2026-08-13 "Feature 4 live-testing" section for the full
 trial-by-trial evidence and the "ghost tab" symptom (content reachable, no
 tab-strip entry at all) this was chasing.
 
+**The "ghost tab" itself turned out to be a separate, simpler bug**: a
+retest with a single never-grouped tab (ruling out stacks) reproduced the
+same symptom, and the screenshot gave it away — `resolveOrCreateWindowForWorkspace`'s
+`chrome.windows.create({})` always gives the new window its own default
+blank/startpage tab, which was never being cleaned up. The destination
+window always had *two* tabs (the leftover default, generically labeled,
+plus the real moved-in one); what looked like a tab with no tab-strip entry
+was actually the leftover default tab sitting there under a confusing
+generic label, not a rendering bug. `resolveOrCreateWindowForWorkspace` now
+captures that default tab's id (`chrome.tabs.query` right after creation —
+the `chrome.windows.create` callback doesn't reliably return a populated
+`tabs` array) and returns it; both callers close it via a new
+`closeDefaultTabIfSafe(windowId, defaultTabId)` helper once their own move
+has landed (guarded to only fire once the window has more than one tab, so
+a failed move never empties/closes the window). See the planning doc's
+"ghost tab" 2026-08-13 section.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or

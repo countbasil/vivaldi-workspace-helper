@@ -1342,3 +1342,54 @@ Events/Vivaldi) the first time the relay actually needs to run
 bridge script triggers the equivalent prompt for a different process
 (Keyboard Maestro Engine) and nobody had hit Feature 4's own first-run case
 yet before now.
+
+### The "ghost tab" explained: a leftover default tab, not a rendering bug (2026-08-13, still later)
+
+Aaron restarted Vivaldi to pick up the three fixes above and immediately
+retested with a single, never-grouped tab (an Atlantic article) -- ruling
+out tab stacks as the explanation this time. Reported the same symptom as
+before, with a screenshot: moved the tab to "Home," a new window opened
+correctly assigned to that workspace, the *content* pane showed the
+Atlantic article -- but the only tab-strip entry visible read "Blank Page,"
+with an unexplained "1" badge and a thin progress-bar-like line under it.
+Separately, back in the *origin* window, closing things eventually surfaced
+an old YouTube tab from an earlier trial with -- again -- no tab-strip entry
+for it at all.
+
+Re-reading the screenshot description against the code rather than assuming
+this was still the same unexplained rendering bug: `resolveOrCreateWindowForWorkspace`'s
+create-branch calls `chrome.windows.create({})`, which always gives the new
+window its own default blank/startpage tab -- and neither it nor its
+callers (`jumpToTab`, `moveSelectedTabsToWorkspace`) ever cleaned that tab
+up. So the destination window always ended up with *two* tabs: the
+leftover default one, and the real moved-in one. This had been true since
+Feature 4 was first written, and was even visible in Claude's own earlier
+test sessions (a stray `chrome://vivaldi-webui/startpage` tab that had to
+be manually deleted after each successful create-window test) -- just
+misfiled as test-harness cleanup rather than recognized as a real, shipped
+bug. The likely resolution of the "Blank Page" mystery: that generic label
+*is* the leftover default tab, sitting there literally, while the real
+moved tab (the one with an actual page and title) is the one that's
+missing or misrendered from the strip -- not a single tab with a confused
+identity, but two real tabs where only one is showing correctly.
+
+Fix: `resolveOrCreateWindowForWorkspace` now captures the new window's
+default tab id right after creating it (via a `chrome.tabs.query` -- the
+`chrome.windows.create` callback's own return value doesn't reliably
+include a populated `tabs` array), returns it alongside `windowId`/
+`created`, and both callers close it (via a new `closeDefaultTabIfSafe`
+helper, guarded so it only ever fires once the window has more than one
+tab -- never leaving the window empty/auto-closed if the real move
+somehow failed) once their own tab move has landed.
+
+This does not explain the *second* symptom (an old tab resurfacing with no
+tab-strip entry in the *origin* window after the moved tab left) -- that one
+matches the "Cmd+W recalls a tab from a workspace-replaced window" and
+"MRU extensions surfacing old tabs" native quirks Aaron already flagged as
+out of scope for this project, and is left as likely the same class of
+native Vivaldi flakiness rather than something caused by this code, which
+never touches the origin window at all after a successful move.
+
+Not yet independently re-confirmed live by Claude (Aaron was actively
+testing solo again); reinstalled and pushed based on the evidence and
+screenshot already provided, same pattern as the previous fix round.
