@@ -438,6 +438,20 @@ permanently unreachable through any UI interaction. See the README's
 Feature 4 section and the planning doc's 2026-08-13 "chrome.tabs.move
 itself is what's broken" section for the full live-diagnosis trail.
 
+**Not a bug: a destination window ending up with a new tab stack.**
+Vivaldi's tab-stack membership lives in a `group` UUID inside `vivExtData`
+— a proprietary field entirely separate from Chrome's `groupId`/
+`tabGroups` API (which stays `-1` for real Vivaldi stacks; this is why the
+earlier `chrome.tabs.ungroup` step from the tab-stacks fix never actually
+did anything for genuine Vivaldi stacks). No extension API can touch it —
+`chrome.tabs.update()` silently ignores an attempt to overwrite
+`vivExtData`. Confirmed live that a plain `Cmd+T` into a window with one
+existing tab produces the identical stack `recreateTabInWindow` does, with
+zero involvement from this project's code — it's Aaron's own Vivaldi
+"automatically create tab stacks" setting reacting to any new tab, not
+something Feature 4 causes or can suppress per-move. See the planning
+doc's 2026-08-14 section.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or

@@ -323,6 +323,17 @@ neighbors — there's no way to preserve a stack across a window boundary at
 all. See the planning doc's 2026-08-13 sections for the full live-diagnosis
 trail (this took two rounds of fixes to actually nail down).
 
+**If your destination window ends up with a new tab stack you didn't ask
+for**, that's Vivaldi's own "automatically create tab stacks" setting, not
+something this project is doing — confirmed live: creating a tab via a
+genuine `Cmd+T` in a window that already has exactly one tab produces the
+*exact same* stack, with no Feature 4 involvement at all. There's no
+extension API this project can use to prevent it (Vivaldi's tab-stack
+membership lives in a proprietary field not exposed to `chrome.tabs`, and
+directly overwriting it is silently ignored). If you don't want this,
+disable that Vivaldi setting; it's not something Feature 4 can control on
+a per-move basis.
+
 ---
 
 ## Uninstalling

@@ -1476,3 +1476,77 @@ detect "the user just pressed a native shortcut" from injected page JS, the
 same category of ceiling as the removed in-page ⌥⌘J listener). Shortening
 the duration doesn't eliminate the false trigger, but makes it far less
 disruptive when it happens.
+
+### The pin/unpin ghost-tab trick didn't reproduce for Claude; a real tab-stacking side effect did (2026-08-14)
+
+Aaron reported a promising-sounding discovery: pinning then unpinning a
+ghost tab made it reappear in the tab strip. Tested live, twice -- once via
+the raw `chrome.tabs.update({pinned:...})` API, once via a genuine `Cmd+P`
+keyboard shortcut (in case the native UI action did something the API call
+didn't) -- against a freshly-created ghost tab (the same `chrome.tabs.move`
+repro used throughout the day). Neither reproduced it; the tab stayed
+invisible through the full pin-then-unpin cycle both times. Aaron then
+clarified the tab he'd fixed wasn't from a move at all -- just a phantom he
+noticed sitting in a window already, cause unknown. Given production code
+no longer uses `chrome.tabs.move` at all (the prior fix already sidesteps
+this bug entirely), further chasing this specific repro wasn't worth it;
+noted as a general manual recovery trick worth knowing about for whatever
+native ghost-tab cases still exist (e.g. the Cmd+W/MRU one), not something
+to build into the code.
+
+This session also hit real tooling instability -- several `Bash` tool calls
+came back reporting "interrupted by user" when Aaron was, by his own
+account, not even at the computer for one of them. Never resolved; worth
+knowing this can happen and isn't necessarily a real interruption. One
+genuine mistake happened during the confusion: a stray `Cmd+P` (meant for
+Vivaldi) landed in VS Code instead because Claude sent it without
+re-activating Vivaldi first, opening VS Code's Quick Open dialog. Escaped
+out of it without further incident, but it's a reminder to always
+re-activate the target application immediately before *each* synthetic
+keystroke in a sequence, not just the first one -- focus can move between
+steps for reasons outside the automation's control.
+
+Aaron then separately reported Feature 4 itself working correctly (the
+recreate-based fix holding up), but with a new side effect: the destination
+window's existing tab and the newly-moved tab end up in a Vivaldi tab
+stack together. Reproduced live and root-caused precisely: Vivaldi's tab
+stacks are its own proprietary feature, tracked via a `group` UUID inside
+`vivExtData` -- a field completely separate from Chrome's standard
+`groupId`/`tabGroups` API (which stays `-1` throughout). This explains why
+the tab-stacks fix from earlier in the day (`chrome.tabs.ungroup` on
+grouped tabs) never actually did anything useful for real Vivaldi
+stacks -- it was checking the wrong field the whole time. Confirmed there's
+no extension-API path to touch this at all: `chrome.tabs.update()` accepts
+a `vivExtData` parameter without error but silently ignores it (the
+returned tab still shows the old value), and `chrome.tabs` only exposes
+`group`/`ungroup`, both operating on the Chrome-standard `groupId`.
+
+Decisive test: reproduced the exact same stacking via a **genuine `Cmd+T`**
+keystroke (not any of this project's code at all) into the same
+single-tab window -- the manually-created tab got tagged with the exact
+same `group` UUID as the tab moved in via `recreateTabInWindow`. This is
+Aaron's own "automatically create tab stacks" Vivaldi setting reacting to
+*any* new tab landing in a window that already has exactly one, not
+something this project's code is doing or can prevent. No code fix exists
+or is being pursued; documented as expected behavior tied to that Vivaldi
+setting, with the practical takeaway that disabling the setting (if
+unwanted) is a Vivaldi-side choice, not something Feature 4 can control
+independently per-move.
+
+**A real mistake, disclosed**: while cleaning up test tabs at the end of
+this investigation, closed a tab believed to be Claude's own test artifact
+based on a quick glance, without verifying carefully enough first --
+turned out to be one of Aaron's real tabs (`duckduckgo.com`, tagged to his
+Home workspace), misidentified because a same-session test tab happened to
+share superficial similarity. Caught by re-examining the evidence
+(the tab's `parent_ext_id` matched other tabs already confirmed real
+across the whole session, not anything Claude's own scripts had created)
+immediately after deleting it, before doing anything else. Recovered fully
+and exactly via `chrome.sessions.getRecentlyClosed()` +
+`chrome.sessions.restore()` -- found the matching entry by its unchanged
+`ext_id`, restored it, confirmed it came back with the identical
+`vivExtData` (same `ext_id`, same `workspaceId`). No data lost, but the
+near-miss is worth remembering: verify a tab's actual origin (cross-check
+`ext_id`/`vivExtData` against tabs already confirmed created this session)
+before deleting anything during live testing, not just a plausible-looking
+guess from a URL glanced at in a list.
