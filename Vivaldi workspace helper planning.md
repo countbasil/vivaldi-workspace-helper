@@ -1550,3 +1550,50 @@ near-miss is worth remembering: verify a tab's actual origin (cross-check
 `ext_id`/`vivExtData` against tabs already confirmed created this session)
 before deleting anything during live testing, not just a plausible-looking
 guess from a URL glanced at in a list.
+
+### Re-testing the native "move tab to workspace" bug in Vivaldi Snapshot: still broken (2026-08-13)
+
+Aaron tried the native "Move Active Tab to Workspace" action in a freshly
+installed Vivaldi Snapshot (8.2.4129.3, newer than the 8.1.4087.64 stable
+build the original bug report was filed against) and it appeared to work,
+raising the question of whether the upstream bug had been fixed and
+Feature 4 was no longer needed. Since the fresh Snapshot install was
+explicitly disposable ("just installed... use the main version... without
+worrying about interfering with anything of mine"), tested directly
+against it rather than through an isolated throwaway profile (an isolated
+`--user-data-dir` instance was tried first, out of caution, before Aaron
+said the real one was fine to use -- abandoned after discovering a real
+hazard: with two processes both literally named "Vivaldi Snapshot",
+several System Events lookups meant to be scoped to the throwaway
+instance by PID/window-title instead silently resolved to Aaron's real
+browser windows. Screen-coordinate `click at {x,y}` stayed reliable, since
+it hit-tests whatever is actually on screen rather than resolving a
+process/window reference by name -- but any named-lookup automation
+across two same-named processes is unsafe and shouldn't be attempted
+again without ruling out that ambiguity first).
+
+Found Aaron's actual keybinding for the relevant commands by reading his
+real `Preferences` JSON directly (`vivaldi.actions[0].COMMAND_WORKSPACE_MOVE_TABS_TO_1/2`)
+rather than assuming Vivaldi's documented defaults, since he'd mentioned his
+mappings weren't stock: both were in fact still `ctrl+shift+1`/`ctrl+shift+2`.
+Relaunched the real Snapshot with `--remote-debugging-port=9222` (a normal
+quit + relaunch, done with Aaron's explicit go-ahead since the profile was
+disposable), created a fresh test tab in the non-focused workspace via
+`chrome.tabs.create`, confirmed its `vivExtData.workspaceId` via CDP, then
+tried moving it two different ways:
+
+- Synthetic keystroke via System Events, twice (`keystroke "1" using
+  {control down, shift down}`, then `key code 18 using {...}` in case the
+  first didn't match Vivaldi's accelerator matching) -- no change.
+- Asked Aaron to do it himself, live, both via the real keyboard shortcut
+  and via the tab's right-click → Move → workspace menu -- **"sigh neither
+  worked"**.
+
+Checked the tab's `vivExtData.workspaceId` via CDP immediately after: still
+tagged to its original workspace, unchanged. So the bug is confirmed still
+present in this newer Snapshot build via an authoritative real-user test on
+both input paths, not just synthetic automation -- Aaron's initial
+impression of a fix was very likely a fluke or a mix-up with some other
+action, not evidence of an upstream fix. Feature 4 remains necessary;
+no script-interference testing was done since the premise it was
+conditioned on didn't hold.
