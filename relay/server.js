@@ -24,7 +24,16 @@
 //        place of Vivaldi's own broken shortcut. Same response shape as
 //        above, plus {ok:false, reason:"MISSING_WORKSPACE_PARAM"} (400) if
 //        the query param is absent, or {reason:"UNKNOWN_WORKSPACE"} /
-//        {reason:"NO_SELECTED_TABS"} from the page side.
+//        {reason:"NO_SELECTED_TABS"} from the page side. Deliberately
+//        leaves focus on the window the request came from rather than
+//        following the tab(s) to their destination -- see
+//        /jump-last-moved-tabs below for how to actually get there.
+//   GET  http://127.0.0.1:<port>/jump-last-moved-tabs
+//        -- focuses whichever window the most recent
+//        /move-selected-tabs-to-workspace call moved tabs into. Same
+//        response shape as /jump-last-routed, plus
+//        {reason:"NO_RECENT_MOVE"} (nothing moved yet this session) or
+//        {reason:"TARGET_WINDOW_GONE"} (that window was closed since).
 //
 // Also handles a message *from* the browser side, {type:"activateWorkspace",
 // requestId, workspaceName}: bringing a workspace on screen has no JS API
@@ -107,6 +116,10 @@ function handleMoveSelectedTabsToWorkspace(res, workspaceName) {
   sendBrowserRequest(res, { type: "moveSelectedTabsToWorkspace", workspaceName });
 }
 
+function handleJumpLastMovedTabs(res) {
+  sendBrowserRequest(res, { type: "jumpLastMovedTabs" });
+}
+
 const server = http.createServer((req, res) => {
   const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   if (req.method === "GET" && parsed.pathname === "/jump-last-routed") {
@@ -114,6 +127,9 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && parsed.pathname === "/move-selected-tabs-to-workspace") {
     return handleMoveSelectedTabsToWorkspace(res, parsed.searchParams.get("workspace"));
+  }
+  if (req.method === "GET" && parsed.pathname === "/jump-last-moved-tabs") {
+    return handleJumpLastMovedTabs(res);
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found");

@@ -273,8 +273,20 @@ Moves whatever tab(s) are currently selected (the active tab, or a
 cmd+click multi-selection across several tabs) in Vivaldi's focused window
 to the named workspace — creating and assigning a window for it first if
 none exists yet, exactly like Features 1–3 already do, so nothing already
-in that window gets disturbed. Shows a small "Moved N tab(s) to `<emoji>`
-`<name>`" toast when it's done.
+in that window gets disturbed. Focus deliberately stays on the window you
+triggered the move from — the moved tab(s) aren't followed there
+automatically. Instead, a "Moved N tab(s) to `<emoji>` `<name>`" toast
+appears with a click-to-switch action, and the same jump is reachable from
+outside Vivaldi too:
+
+```
+GET http://127.0.0.1:8877/jump-last-moved-tabs
+```
+
+— focuses whichever window the most recent move landed in, whether or not
+its toast is still on screen. Bind this to its own hotkey alongside the
+per-workspace move macros below if you want a keyboard-only way to follow
+a move without reaching for the mouse.
 
 **First use will prompt for an Accessibility/Automation permission** — the
 relay drives Vivaldi's Window menu via System Events (same as Feature 3's
@@ -299,12 +311,19 @@ workspace names containing spaces correctly — don't just paste the name
 straight into the URL. Same mirrored pattern as Feature 3's per-workspace
 macros, just hitting the relay instead of running the CDP bridge script.
 
-Response is JSON: `{"ok":true, "windowId":…, "tabCount":…, "workspaceName":…, "created":…}`
-on success, or `{"ok":false, "reason":…}` — `"UNKNOWN_WORKSPACE"` (name
+Response is JSON: `{"ok":true, "windowId":…, "sourceWindowId":…, "tabCount":…,
+"workspaceId":…, "workspaceName":…, "created":…}` on success (`windowId` is
+the destination the tabs moved to; `sourceWindowId` is the window focus
+stayed on), or `{"ok":false, "reason":…}` — `"UNKNOWN_WORKSPACE"` (name
 didn't match any configured workspace), `"NO_SELECTED_TABS"` (shouldn't
 normally happen — the active tab is always at least itself), `"NOT_CONNECTED"`
 (relay is up but nothing's connected from the browser side — reinstall/
 restart Vivaldi), or `"TIMEOUT"`.
+
+`GET /jump-last-moved-tabs` responds `{"ok":true, "windowId":…}` (the window
+it just focused) or `{"ok":false, "reason":…}` — `"NO_RECENT_MOVE"` (nothing
+moved yet this session), `"TARGET_WINDOW_GONE"` (that window was closed
+since), plus the same `"NOT_CONNECTED"`/`"TIMEOUT"` as above.
 
 **How a "move" actually works, and what that costs.** Rather than moving a
 tab to its destination window, this closes the original and creates a new

@@ -67,6 +67,7 @@
 
   let workspaceStore = null;
   let lastRoutedTab = null;
+  let lastMovedTabs = null;
   let relaySocket = null;
   let relayRetryDelay = 1000;
   let nextRelayRequestId = 1;
@@ -515,7 +516,16 @@
   // exactly this "find or create the one window for this workspace" step,
   // just followed by different things (moving one specific tab vs. moving
   // whatever's currently selected).
-  async function resolveOrCreateWindowForWorkspace(workspaceId, workspaceName) {
+  // focusExisting controls whether an already-open target window is raised
+  // as part of resolving it. jumpToTab wants that (the whole point is to end
+  // up looking at the target); moveSelectedTabsToWorkspace passes false --
+  // moving tabs into a window doesn't require it to be focused, and that
+  // caller wants to stay on the source window instead (see its own comment).
+  // A brand-new window is always left focused regardless -- unavoidable,
+  // since activateWorkspaceViaMenu's AppleScript acts on the frontmost
+  // window -- callers that don't want that (moveSelectedTabsToWorkspace)
+  // reclaim focus themselves afterward.
+  async function resolveOrCreateWindowForWorkspace(workspaceId, workspaceName, { focusExisting = true } = {}) {
     let targetWindowId = findWindowDisplayingWorkspace(workspaceId);
     let created = false;
     // Set only when we create a brand-new window: its own default blank/
@@ -532,7 +542,7 @@
     let defaultTabId = null;
 
     if (targetWindowId != null) {
-      await chrome.windows.update(targetWindowId, { focused: true });
+      if (focusExisting) await chrome.windows.update(targetWindowId, { focused: true });
     } else if (workspaceName) {
       const newWin = await new Promise((resolve) => chrome.windows.create({}, resolve));
       targetWindowId = newWin.id;
@@ -684,7 +694,11 @@
       );
       if (!selectedTabs.length) return { ok: false, reason: "NO_SELECTED_TABS" };
 
-      const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
+      // focusExisting: false -- unlike jumpToTab, this caller doesn't want
+      // to end up looking at the destination (see below).
+      const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name, {
+        focusExisting: false,
+      });
 
       if (targetWindowId !== sourceWin.id) {
         // Recreate each selected tab in the destination rather than
@@ -702,21 +716,76 @@
       }
       await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
 
-      return { ok: true, windowId: targetWindowId, tabCount: selectedTabs.length, workspaceName: ws.name, workspaceEmoji: ws.emoji, created };
+      // Stay on the window the user triggered this from rather than
+      // following the moved tab(s) to the destination -- per Aaron's
+      // feedback (2026-08-14), the old behavior of ending up on the
+      // destination workspace was disorienting for a background move
+      // triggered by an external hotkey. The destination is reachable via
+      // the toast below (or jumpToLastMovedTabs) instead. Only need to
+      // reclaim focus when the target differs from source: same-window case
+      // never lost it, and the create-new-window branch above is the one
+      // case that does (a freshly created window is always left focused, so
+      // activateWorkspaceViaMenu's AppleScript -- which acts on the
+      // frontmost window -- has the right target).
+      if (targetWindowId !== sourceWin.id) {
+        await chrome.windows.update(sourceWin.id, { focused: true });
+      }
+
+      const result = {
+        ok: true,
+        windowId: targetWindowId,
+        sourceWindowId: sourceWin.id,
+        tabCount: selectedTabs.length,
+        workspaceId: ws.id,
+        workspaceName: ws.name,
+        workspaceEmoji: ws.emoji,
+        created,
+      };
+      lastMovedTabs = { workspaceId: ws.id, workspaceName: ws.name, workspaceEmoji: ws.emoji };
+      return result;
     } catch (e) {
       return { ok: false, reason: String((e && e.message) || e) };
     }
   }
 
+  // Shows on the SOURCE window (see moveSelectedTabsToWorkspace's own
+  // comment on why focus stays there) -- interactive, unlike the other
+  // informational variants: there's a real destination to jump to, the user
+  // just isn't looking at it yet. Click (or jumpToLastMovedTabs via the
+  // relay) focuses it.
   function showMovedTabsToast(result) {
     chrome.runtime.sendMessage({
       type: "vwh-show-toast",
       variant: "moved-tabs",
-      displayWindowId: result.windowId,
+      displayWindowId: result.sourceWindowId,
+      workspaceId: result.workspaceId,
       workspaceName: result.workspaceName,
       workspaceEmoji: result.workspaceEmoji,
       tabCount: result.tabCount,
     });
+  }
+
+  // Brings the destination of the most recent moveSelectedTabsToWorkspace
+  // call to the front. Unlike jumpToTab there's never anything left to move
+  // -- the tabs already landed there synchronously as part of the move
+  // itself -- so this only ever needs to focus a window. Re-derives it fresh
+  // via findWindowDisplayingWorkspace rather than trusting a stored window
+  // id, same reasoning as jumpToTab: the window could have been closed (or
+  // the workspace reassigned elsewhere) since the move happened.
+  async function focusWorkspaceWindow(workspaceId) {
+    try {
+      const targetWindowId = findWindowDisplayingWorkspace(workspaceId);
+      if (targetWindowId == null) return { ok: false, reason: "TARGET_WINDOW_GONE" };
+      await chrome.windows.update(targetWindowId, { focused: true });
+      return { ok: true, windowId: targetWindowId };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
+  async function jumpToLastMovedTabs() {
+    if (!lastMovedTabs) return { ok: false, reason: "NO_RECENT_MOVE" };
+    return focusWorkspaceWindow(lastMovedTabs.workspaceId);
   }
 
   function requestActivateWorkspace(workspaceName) {
@@ -769,6 +838,11 @@
       if (msg.type === "moveSelectedTabsToWorkspace") {
         const result = await moveSelectedTabsToWorkspace(msg.workspaceName);
         if (result.ok) showMovedTabsToast(result);
+        socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
+        return;
+      }
+      if (msg.type === "jumpLastMovedTabs") {
+        const result = await jumpToLastMovedTabs();
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }
@@ -867,6 +941,13 @@
           if (!result.ok) console.error(TAG, "jumpToTab failed:", result.reason, message);
         });
       }
+      // Sent by window-toast.js on a "moved-tabs" toast click -- see
+      // showMovedTabsToast above for why that toast is interactive.
+      if (message.type === "vwh-focus-workspace-request") {
+        focusWorkspaceWindow(message.workspaceId).then((result) => {
+          if (!result.ok) console.error(TAG, "focusWorkspaceWindow failed:", result.reason, message);
+        });
+      }
     });
 
     refreshFocusedWorkspaceBaseline();
@@ -880,6 +961,10 @@
       jumpToLastRoutedTab,
       get lastRoutedTab() {
         return lastRoutedTab;
+      },
+      jumpToLastMovedTabs,
+      get lastMovedTabs() {
+        return lastMovedTabs;
       },
     };
     console.log(TAG, "Ready");

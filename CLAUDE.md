@@ -373,7 +373,8 @@ to an external hotkey in place of Vivaldi's broken one):
   the window-resolution logic), moves every selected tab there in one
   `chrome.tabs.move` call, and re-activates whichever one was already
   active. Shows a `"moved-tabs"` toast (`window-toast.js`) on success:
-  "Moved N tab(s) to `<emoji>` `<name>`".
+  "Moved N tab(s) to `<emoji>` `<name>`" (see "Focus stays on the source
+  window" below for how this toast behaves as of 2026-08-14).
 - Setup mirrors Feature 3's per-workspace Keyboard Maestro macros exactly,
   just hitting the relay instead of running the CDP bridge script — see the
   README's Feature 4 section for the full macro setup.
@@ -452,6 +453,61 @@ zero involvement from this project's code — it's Aaron's own Vivaldi
 something Feature 4 causes or can suppress per-move. See the planning
 doc's 2026-08-14 section.
 
+**Focus stays on the source window (2026-08-14).** Originally
+`moveSelectedTabsToWorkspace` left the *destination* window focused after a
+move (a side effect of `resolveOrCreateWindowForWorkspace` always focusing
+whichever window it resolves, since `jumpToTab` — its other caller — wants
+exactly that). Per Aaron's feedback, that was disorienting for a move
+triggered from an external hotkey: you're working in window A, you move a
+tab to workspace B, and suddenly you're looking at window B instead of
+still being in A. Fixed:
+
+- `resolveOrCreateWindowForWorkspace(workspaceId, workspaceName, {
+  focusExisting })` — new third parameter, default `true`. When an existing
+  target window is reused, `focusExisting: false` skips the
+  `chrome.windows.update(..., {focused:true})` call entirely (moving tabs
+  into a window via `chrome.tabs.create`/`recreateTabInWindow` doesn't
+  require it to be focused). `jumpToTab` still passes the default (it wants
+  to end up looking at the target); `moveSelectedTabsToWorkspace` passes
+  `false`. A brand-new window is unavoidably left focused either way —
+  `chrome.windows.create({})` always makes it frontmost, and
+  `activateWorkspaceViaMenu`'s AppleScript needs it that way (`tell
+  application "Vivaldi" to activate` acts on the frontmost window) — so
+  `moveSelectedTabsToWorkspace` explicitly reclaims focus for the *source*
+  window itself afterward whenever `targetWindowId !== sourceWin.id`.
+- The `"moved-tabs"` toast is now shown on the *source* window
+  (`displayWindowId: result.sourceWindowId`, not `result.windowId`) and is
+  now **interactive**, unlike `"foreground-switch"`/`"raised-window"`/
+  `"created-window"` — those three are purely informational because the
+  jump they describe already happened and put you *at* the destination;
+  `"moved-tabs"` is different precisely because focus deliberately stayed
+  behind, so there's still somewhere real to go. Clicking it (or triggering
+  the new relay endpoint below) focuses the destination window — never
+  needs to touch a tab, since the move itself already landed the tab(s)
+  there synchronously; it's a pure `chrome.windows.update(..., {focused:
+  true})`. Text changed from `"Moved N tab(s) to X"` to `"Moved N tab(s) to
+  X\n\nClick to switch"` to match, and it now gets the same `TOAST_DURATION_MS`
+  (8s) as `"route"` instead of the short informational duration, since the
+  user may actually need to read and act on it.
+- `window-toast.js`'s `activeTarget` gained a `kind` field (`"route"` vs.
+  `"moved-tabs"`) so `jumpToActiveTarget` can send the right follow-up
+  message on click — `"route"` sends `vwh-jump-request` (tabId +
+  workspaceId, handled by `jumpToTab`); `"moved-tabs"` sends the new
+  `vwh-focus-workspace-request` (workspaceId only, handled by the new
+  `focusWorkspaceWindow(workspaceId)` in `workspace-route-watcher.js`, which
+  re-derives the target window fresh via `findWindowDisplayingWorkspace`
+  rather than trusting a stored id — same reasoning as `jumpToTab`: the
+  window could have been closed, or the workspace reassigned, since the
+  move happened).
+- New module-level `lastMovedTabs` (workspaceId/workspaceName/emoji,
+  analogous to `lastRoutedTab`) plus `jumpToLastMovedTabs()`, reachable
+  externally the same way `jumpToLastRoutedTab()` already is: a
+  `jumpLastMovedTabs` relay message type and a new
+  `GET /jump-last-moved-tabs` endpoint in `relay/server.js`. This is the
+  "separate trigger" half of the feature — bind it to its own hotkey
+  alongside the per-workspace move macros, for jumping to wherever the last
+  move landed without having to still see its toast.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
@@ -460,5 +516,6 @@ doc's 2026-08-14 section.
   `[VWH-toast]`-prefixed ones (the toast, per-window in `window.html`), and
   `[WTS]`-prefixed ones (the sibling theme-switcher, if also installed).
 - `window.__vwh` is exposed at runtime in `main.html` for live inspection:
-  `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`.
+  `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`,
+  `__vwh.lastMovedTabs`, `__vwh.jumpToLastMovedTabs()`.
 - Relay logs: `~/Library/Logs/vivaldi-workspace-relay.log`.

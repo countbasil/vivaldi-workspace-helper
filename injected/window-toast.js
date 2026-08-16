@@ -35,16 +35,30 @@
   let myWindowId = null;
   let toastEl = null;
   let dismissTimer = null;
-  let activeTarget = null; // { tabId, workspaceId, workspaceName } for the tab this toast points at
+  // { kind: "route", tabId, workspaceId, workspaceName } for a routed tab
+  // still sitting wherever it landed, or { kind: "moved-tabs", workspaceId,
+  // workspaceName } for tabs moveSelectedTabsToWorkspace already moved --
+  // the two need different follow-up messages (see jumpToActiveTarget).
+  let activeTarget = null;
 
   function jumpToActiveTarget() {
     if (!activeTarget) return;
-    chrome.runtime.sendMessage({
-      type: "vwh-jump-request",
-      tabId: activeTarget.tabId,
-      workspaceId: activeTarget.workspaceId,
-      workspaceName: activeTarget.workspaceName,
-    });
+    if (activeTarget.kind === "moved-tabs") {
+      // The tab(s) already landed at their destination -- nothing left to
+      // move, just bring that window to the front.
+      chrome.runtime.sendMessage({
+        type: "vwh-focus-workspace-request",
+        workspaceId: activeTarget.workspaceId,
+        workspaceName: activeTarget.workspaceName,
+      });
+    } else {
+      chrome.runtime.sendMessage({
+        type: "vwh-jump-request",
+        tabId: activeTarget.tabId,
+        workspaceId: activeTarget.workspaceId,
+        workspaceName: activeTarget.workspaceName,
+      });
+    }
     dismissToast();
   }
 
@@ -83,22 +97,28 @@
   function showToast(message) {
     dismissToast(); // replace anything already showing
 
-    // "route" (default, undefined variant) is the only interactive one --
-    // there's an actual tab to jump to. "foreground-switch" (Vivaldi
-    // reassigned the *current* window's own workspace in place -- see
-    // workspace-route-watcher.js's onWorkspaceStoreChanged), "raised-window"
-    // (an existing window already displaying the target workspace was
-    // focused automatically), "created-window" (no window displayed the
-    // target workspace, so one was created and assigned automatically) --
-    // see handleBackgroundTab's active-tab branch for all three -- and
-    // "moved-tabs" (moveSelectedTabsToWorkspace finished moving the
-    // currently-selected tab(s), triggered externally via the relay) are
-    // purely informational: whatever they're telling you about already
-    // happened, so clicking just dismisses instead of jumping.
+    // "route" (default, undefined variant) and "moved-tabs" are the
+    // interactive ones -- each has a real destination window to jump to.
+    // "foreground-switch" (Vivaldi reassigned the *current* window's own
+    // workspace in place -- see workspace-route-watcher.js's
+    // onWorkspaceStoreChanged), "raised-window" (an existing window already
+    // displaying the target workspace was focused automatically), and
+    // "created-window" (no window displayed the target workspace, so one
+    // was created and assigned automatically) -- see handleBackgroundTab's
+    // active-tab branch for all three -- are purely informational: whatever
+    // they're telling you about already happened, so clicking just
+    // dismisses instead of jumping. "moved-tabs" is different from those
+    // three: moveSelectedTabsToWorkspace deliberately leaves focus on the
+    // *source* window (see its own comment) rather than following the
+    // tab(s) to their destination, so unlike the others there's still
+    // somewhere real to jump to when this toast is clicked.
     const variant = message.variant || "route";
-    const interactive = variant === "route";
+    const interactive = variant === "route" || variant === "moved-tabs";
     if (interactive) {
-      activeTarget = { tabId: message.targetTabId, workspaceId: message.workspaceId, workspaceName: message.workspaceName };
+      activeTarget =
+        variant === "moved-tabs"
+          ? { kind: "moved-tabs", workspaceId: message.workspaceId, workspaceName: message.workspaceName }
+          : { kind: "route", tabId: message.targetTabId, workspaceId: message.workspaceId, workspaceName: message.workspaceName };
     }
 
     const viewport = getContentViewportRect();
@@ -135,7 +155,7 @@
       el.textContent = `Created window for ${emoji} ${workspaceLabel}`;
     } else if (variant === "moved-tabs") {
       const n = message.tabCount || 1;
-      el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}`;
+      el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}\n\nClick to switch`;
     } else {
       el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick to switch`;
     }
