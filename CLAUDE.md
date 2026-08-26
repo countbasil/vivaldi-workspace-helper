@@ -790,17 +790,17 @@ function on every `"change"` event. Setting `.checked` directly (loading
 the sticky value from `chrome.storage.local`) doesn't fire `"change"`, so
 that load path calls `syncBox()` explicitly too.
 
-**Tab-order added, but unverified whether Tab even reaches this document.**
+**Tab-order added, and confirmed live to work (2026-08-25, Aaron tested).**
 Per Aaron's request, explicit ascending `tabIndex` values (workspace
 buttons 1..n, then the two checkboxes at 1000/1001, then the URL field at
-1002 despite sitting first in the DOM) now define a specific cycle order
+1002 despite sitting first in the DOM) define a specific cycle order
 independent of DOM position. Unlike the letter shortcuts, this needs no
 keydown handling at all -- per-element focus-cycling on Tab is native
 browser behavior, the same category as the input's own left/right-arrow
-text-cursor movement (see the keyboard-navigation comment above), so it
-should work despite Tab being a plausible candidate for the same kind of
-global interception that already claimed Escape/Enter/Space/arrows. This
-hasn't been confirmed live yet either way.
+text-cursor movement (see the keyboard-navigation comment above). Tab
+cycled through exactly that order when actually tested, confirming it is
+*not* in the same globally-intercepted bucket as Escape/Enter/Space/arrows
+-- safe to rely on for future dialogs/toasts in this project.
 
 **A visible Cancel/Save row, and an "s" naming collision it created
 (2026-08-25).** Aaron asked for a bottom-right "(C)ancel  (S)ave new Rule"
@@ -822,6 +822,45 @@ workspace-list items below them rather than smaller; the workspace list
 gained subtle top/bottom border lines; and the checkboxes' text and box
 size were both reduced.
 
+### Tab reinstated for the "moved-tabs" toast only (2026-08-26)
+
+Building the add-rule dialog's keyboard scheme surfaced a mechanism the
+original in-page ⌥⌘J shortcut never used: giving an element `tabIndex = -1`
+and calling `.focus()` on it pulls keyboard focus into `window.html`'s own
+document even when focus was previously on page content inside `<webview>`
+(a separate process otherwise invisible to this document -- see the
+Second feature section for why that killed the original shortcut, and the
+Fourth feature section's keyboard-navigation writeup for where the
+`tabIndex=-1`/`.focus()` trick was first confirmed live, fixing the
+identical problem for j/k in that dialog). `showToast` now does the same
+thing, but **only for the `"moved-tabs"` variant**, not every interactive
+toast -- `"route"` fires for genuinely background routes (cmd+click, or an
+external open landing in a windowless workspace) that can happen while
+Aaron is doing something unrelated in another tab entirely, and stealing
+focus there would be an unsolicited surprise of exactly the kind this
+project's own "notify before touching the screen" instinct exists to
+avoid. `"moved-tabs"` only ever appears as the direct result of Aaron's own
+move-to-workspace hotkey, so forcing focus there has no such downside.
+
+Once focused, a `keydown` listener on `document` (added when the toast
+shows, removed in `dismissToast` alongside the dismiss timer) triggers the
+same `jumpToActiveTarget()` a click would, on **Tab**. The toast's own text
+was updated to match: "...\n\nClick or press Tab to switch".
+
+**⌥⌘J was tried first, confirmed working, then deliberately removed the
+same day.** An earlier version also bound ⌥⌘J -- the same combo the old,
+removed in-page shortcut used -- and confirmed live (scripted CDP test:
+fabricate a `"moved-tabs"` toast via `chrome.runtime.sendMessage` from
+`main.html`, send a real OS-level keystroke via `System Events`, verify
+`#vwh-toast` was removed from the DOM, the only path to that besides the
+8s timeout or a click being `jumpToActiveTarget` → `dismissToast`) that it
+*does* reach this listener once focus is forced this way -- disproving the
+old assumption that modifier combos were specially blocked the way
+Escape/Enter/Space/arrows are (corrected in the
+`project_keyboard_delivery_in_injected_ui` memory). Removed anyway per
+Aaron's request: Tab alone already covers the need, and a fixed global
+combo like ⌥⌘J risks colliding with a shortcut other people already have
+bound to it elsewhere.
 
 ### Bug found via repeated live use: moving a tab into an *existing* destination window silently auto-jumped there anyway (2026-08-26)
 
@@ -881,6 +920,7 @@ focused by the time each step ran, and it may have moved an already-open
 real tab into an unexpected workspace window as a result -- flagged to
 Aaron rather than guessed at or auto-"fixed.")
 
+## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
   a specific window's entry (for its toast) → **inspect**. Watch for

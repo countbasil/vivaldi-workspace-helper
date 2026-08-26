@@ -42,6 +42,7 @@
   // workspaceName } for tabs moveSelectedTabsToWorkspace already moved --
   // the two need different follow-up messages (see jumpToActiveTarget).
   let activeTarget = null;
+  let toastKeydownHandler = null;
 
   function jumpToActiveTarget() {
     if (!activeTarget) return;
@@ -92,6 +93,10 @@
     if (toastEl) {
       toastEl.remove();
       toastEl = null;
+    }
+    if (toastKeydownHandler) {
+      document.removeEventListener("keydown", toastKeydownHandler);
+      toastKeydownHandler = null;
     }
     activeTarget = null;
   }
@@ -164,7 +169,7 @@
       el.textContent = `Created window for ${emoji} ${workspaceLabel}`;
     } else if (variant === "moved-tabs") {
       const n = message.tabCount || 1;
-      el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}\n\nClick to switch`;
+      el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}\n\nClick or press Tab to switch`;
     } else if (variant === "rule-added") {
       let text = `Rule created: ${message.domain} → ${emoji} ${workspaceLabel}`;
       if (message.moved) text += message.switched ? "\nTab moved" : "\n\nTab moved — click to switch";
@@ -181,6 +186,47 @@
 
     document.body.appendChild(el);
     toastEl = el;
+
+    // Keyboard shortcut for this toast -- scoped to "moved-tabs" only, not
+    // every interactive variant. "route" fires for genuinely background
+    // routes (cmd+click, or an external open landing in a windowless
+    // workspace) that can happen while Aaron is doing something completely
+    // unrelated in another tab -- stealing keyboard focus there would be
+    // exactly the kind of surprise this project exists to avoid (see
+    // CLAUDE.md's "notify before touching the screen" spirit, applied here
+    // to an unsolicited focus steal instead of an explicit action). A
+    // "moved-tabs" toast, by contrast, only ever appears as the direct
+    // result of Aaron's own explicit move-to-workspace hotkey, so focus is
+    // already in a deliberate, expected place.
+    //
+    // The mechanism reuses the add-rule dialog's own discovery (2026-08-25,
+    // see showAddRuleDialog below): giving an element tabIndex=-1 and
+    // calling .focus() on it pulls keyboard focus into this window.html
+    // document even when it was previously on the page content rendered
+    // inside <webview> (a separate process whose focus is otherwise
+    // invisible to this document entirely). That dialog testing confirmed
+    // plain letter keys reach a document-level keydown listener once focus
+    // is forced this way, while Escape/Enter/Space/arrows still never do
+    // (Vivaldi's own chrome intercepts those first).
+    //
+    // Tab is the only binding here (2026-08-26) -- an earlier version also
+    // bound ⌥⌘J (the same combo the old, removed in-page shortcut used) and
+    // confirmed live that it does reach this listener once focus is forced
+    // this way, disproving the old assumption that modifier combos were
+    // specially blocked (see the project_keyboard_delivery_in_injected_ui
+    // memory for that correction). Removed anyway per Aaron's request: Tab
+    // alone already covers the need, and a fixed global combo risks
+    // colliding with shortcuts other people already have bound to ⌥⌘J.
+    if (variant === "moved-tabs") {
+      el.tabIndex = -1;
+      el.focus();
+      toastKeydownHandler = (e) => {
+        if (e.key !== "Tab") return;
+        e.preventDefault();
+        jumpToActiveTarget();
+      };
+      document.addEventListener("keydown", toastKeydownHandler);
+    }
 
     dismissTimer = setTimeout(dismissToast, interactive ? TOAST_DURATION_MS : INFORMATIONAL_TOAST_DURATION_MS);
   }
@@ -348,11 +394,11 @@
     // values are visited in ascending order before any tabIndex=0 element,
     // regardless of DOM position -- 1000+ here just leaves comfortable
     // headroom above however many workspace buttons exist (see their own
-    // tabIndex assignment below). Unverified whether Tab reaches this
-    // document's focus-cycling at all, the same way Escape/Enter/Space/
-    // arrows don't (see the big keyboard-navigation comment above) -- native
-    // per-element focus order is handled below the JS layer, unlike those,
-    // so it may well work despite that; this hasn't been confirmed live yet.
+    // tabIndex assignment below). Confirmed live (2026-08-25, Aaron tested)
+    // that Tab actually cycles through exactly this order -- unlike
+    // Escape/Enter/Space/arrows (see the big keyboard-navigation comment
+    // above), Tab is handled as native per-element focus order below the
+    // JS layer, not globally intercepted the same way.
     input.tabIndex = 1002;
     input.style.cssText = [
       "flex: 1",
