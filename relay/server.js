@@ -34,6 +34,14 @@
 //        response shape as /jump-last-routed, plus
 //        {reason:"NO_RECENT_MOVE"} (nothing moved yet this session) or
 //        {reason:"TARGET_WINDOW_GONE"} (that window was closed since).
+//   GET  http://127.0.0.1:<port>/open-add-rule-dialog
+//        -- opens the "route this domain to a workspace" dialog (Feature 5)
+//        for the active tab in Vivaldi's currently focused window. Same
+//        response shape as /jump-last-routed, plus
+//        {reason:"NO_FOCUSED_WINDOW"}/{reason:"NO_ACTIVE_TAB"} from the page
+//        side. Bind to an external hotkey the same way as the other
+//        endpoints above -- see CLAUDE.md's "Triggering a jump from outside
+//        Vivaldi" section for the recommended macOS Shortcuts.app setup.
 //
 // Also handles a message *from* the browser side, {type:"activateWorkspace",
 // requestId, workspaceName}: bringing a workspace on screen has no JS API
@@ -120,6 +128,10 @@ function handleJumpLastMovedTabs(res) {
   sendBrowserRequest(res, { type: "jumpLastMovedTabs" });
 }
 
+function handleOpenAddRuleDialog(res) {
+  sendBrowserRequest(res, { type: "openAddRuleDialog" });
+}
+
 const server = http.createServer((req, res) => {
   const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   if (req.method === "GET" && parsed.pathname === "/jump-last-routed") {
@@ -130,6 +142,9 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && parsed.pathname === "/jump-last-moved-tabs") {
     return handleJumpLastMovedTabs(res);
+  }
+  if (req.method === "GET" && parsed.pathname === "/open-add-rule-dialog") {
+    return handleOpenAddRuleDialog(res);
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found");

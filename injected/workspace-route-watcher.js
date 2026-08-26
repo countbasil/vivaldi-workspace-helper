@@ -27,6 +27,11 @@
 // showing, which is the exact silent-reassignment problem this whole
 // project exists to avoid (see the planning doc's "Rejected approach").
 //
+// Also exposes the reverse direction (Feature 5): a dialog for adding a new
+// "open in workspace" routing rule for the current tab's domain, reachable
+// via a page context-menu item or an external hotkey through the relay. See
+// the "add-a-routing-rule dialog" section below and resolveLinkRoutesController.
+//
 // HOW MODULE DISCOVERY WORKS
 // --------------------------
 // Same technique as custom.js and bridge/workspace-jump.js: push a no-op
@@ -58,6 +63,11 @@
 (function () {
   const TAG = "[VWH]";
   const SIG_WORKSPACE_STORE = "getActiveWorkspaceId(e){return this.getState().activeWorkspaces.get";
+  // Unique to the module exporting addLinkRoutingRule/removeLinkRoutingRules
+  // (several other modules reference the surrounding CREATE_WORKSPACE_LINK_ROUTE
+  // action-type string too, so this needs to be specific to the method name
+  // itself, not just the feature name).
+  const SIG_LINK_ROUTES_CONTROLLER = "addLinkRoutingRule(";
   const RELAY_PORT = 8877; // must match relay/server.js's PORT
   // Extra settle time before deciding a tab is "background", so a
   // brand-new window's own onFocusChanged (which can lag its onCreated
@@ -66,6 +76,7 @@
   const RELAY_REQUEST_TIMEOUT_MS = 5000;
 
   let workspaceStore = null;
+  let linkRoutesController = null;
   let lastRoutedTab = null;
   let lastMovedTabs = null;
   let relaySocket = null;
@@ -119,6 +130,33 @@
         }
       } catch (e) {
         console.warn(TAG, "req(", id, ") for workspace store threw:", e);
+      }
+    }
+    return false;
+  }
+
+  // Sibling to resolveWorkspaceStore -- same webpack-scan technique, same
+  // module registry, different signature. Confirmed live (2026-08-24) that
+  // this module's addLinkRoutingRule(type, expression, workspaceId) dispatches
+  // the identical Redux action ("CREATE_WORKSPACE_LINK_ROUTE") Vivaldi's own
+  // Settings -> Workspace Rules UI uses, which both updates live rule state
+  // (takes effect immediately) and persists to vivaldi.workspaces.link_routes
+  // in Preferences (verified via a scripted add/remove/re-read of the actual
+  // Preferences file on disk) -- unlike workspace assignment, there's a real
+  // API for this, no AppleScript/menu-click needed.
+  function resolveLinkRoutesController(req) {
+    const ids = findModuleIdsBySignature(req, SIG_LINK_ROUTES_CONTROLLER);
+    for (const id of ids) {
+      try {
+        const mod = req(id);
+        const controller = mod && (mod.Z || mod.ZP || mod);
+        if (controller && typeof controller.addLinkRoutingRule === "function") {
+          linkRoutesController = controller;
+          console.log(TAG, "Found link-routes controller in module", id);
+          return true;
+        }
+      } catch (e) {
+        console.warn(TAG, "req(", id, ") for link-routes controller threw:", e);
       }
     }
     return false;
@@ -549,6 +587,18 @@
       created = true;
       windowsCreatedByJumpToTab.add(targetWindowId);
       setTimeout(() => windowsCreatedByJumpToTab.delete(targetWindowId), 10000);
+      // Aaron reported (2026-08-25) the add-rule context menu item going
+      // missing again specifically after a "move this tab now" that needed
+      // a brand-new window -- a run that didn't need one (existing window,
+      // or a later run after restart) didn't reproduce it. Consistent with
+      // the already-confirmed startup wipe (which also happens amid a wave
+      // of window/subsystem initialization), so window creation itself is
+      // a plausible second trigger -- recheck here too, not just after a
+      // menu click (a click doesn't always lead to this path). Delayed the
+      // same ~500ms as the post-click recheck, since the startup wipe's own
+      // observed timing (present at 1.5s, gone by 1.8s) suggests checking
+      // immediately after the triggering event would be too early to catch it.
+      setTimeout(ensureContextMenuItem, 500);
       const defaultTabs = await new Promise((resolve) => chrome.tabs.query({ windowId: targetWindowId }, resolve));
       if (defaultTabs.length === 1) defaultTabId = defaultTabs[0].id;
       // No extra focus call needed here -- a freshly created window is
@@ -667,6 +717,43 @@
     return workspaces.find((w) => w.name === name) || null;
   }
 
+  // Shared by moveSelectedTabsToWorkspace (external hotkey, "whatever's
+  // selected") and moveTabForRuleDialog (the add-rule dialog's "move this
+  // tab now" checkbox, one specific tab) -- both need exactly "recreate
+  // these tabs in the resolved/created window for this workspace, clean up
+  // any leftover default tab, then decide whose focus wins." focusDestination
+  // mirrors resolveOrCreateWindowForWorkspace's own focusExisting for an
+  // *existing* target window; a brand-new window is always left focused
+  // regardless (see that function's own comment on why), so this reclaims
+  // focus for the source afterward when the caller doesn't want to follow.
+  async function moveTabsToWorkspace(tabs, sourceWindowId, workspaceId, workspaceName, { focusDestination } = {}) {
+    const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(workspaceId, workspaceName, {
+      focusExisting: focusDestination,
+    });
+
+    if (targetWindowId !== sourceWindowId) {
+      // Recreate each tab in the destination rather than cross-window
+      // moving it -- see recreateTabInWindow's own comment for why
+      // chrome.tabs.move turned out to be unreliable here (it also
+      // sidesteps a related, now-moot problem: chrome.tabs.move doesn't
+      // reliably support moving a tab still part of a tab stack/group
+      // across windows either, and recreating never touches the original
+      // tab's group membership at all). Each tab keeps its own original
+      // `active` state, so whichever one was already active ends up the
+      // only one active in the new window too.
+      for (const tab of tabs) {
+        await recreateTabInWindow(tab, targetWindowId, tab.active);
+      }
+    }
+    await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
+
+    if (!focusDestination && targetWindowId !== sourceWindowId) {
+      await chrome.windows.update(sourceWindowId, { focused: true });
+    }
+
+    return { ok: true, windowId: targetWindowId, sourceWindowId, tabCount: tabs.length, created };
+  }
+
   // Workaround for a Vivaldi bug (confirmed live, both the "Move Active Tab
   // to Workspace N" keyboard shortcuts and the tab's own right-click "Move"
   // submenu currently do nothing at all, silently -- reproduces with this
@@ -694,55 +781,40 @@
       );
       if (!selectedTabs.length) return { ok: false, reason: "NO_SELECTED_TABS" };
 
-      // focusExisting: false -- unlike jumpToTab, this caller doesn't want
-      // to end up looking at the destination (see below).
-      const { windowId: targetWindowId, created, defaultTabId } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name, {
-        focusExisting: false,
-      });
-
-      if (targetWindowId !== sourceWin.id) {
-        // Recreate each selected tab in the destination rather than
-        // cross-window moving it -- see recreateTabInWindow's own comment
-        // for why chrome.tabs.move turned out to be unreliable here (it
-        // also sidesteps a related, now-moot problem: chrome.tabs.move
-        // doesn't reliably support moving a tab still part of a tab
-        // stack/group across windows either, and recreating never touches
-        // the original tab's group membership at all). Each tab keeps its
-        // own original `active` state, so whichever one was already active
-        // ends up the only one active in the new window too.
-        for (const tab of selectedTabs) {
-          await recreateTabInWindow(tab, targetWindowId, tab.active);
-        }
-      }
-      await closeDefaultTabIfSafe(targetWindowId, defaultTabId);
-
-      // Stay on the window the user triggered this from rather than
-      // following the moved tab(s) to the destination -- per Aaron's
-      // feedback (2026-08-14), the old behavior of ending up on the
-      // destination workspace was disorienting for a background move
-      // triggered by an external hotkey. The destination is reachable via
-      // the toast below (or jumpToLastMovedTabs) instead. Only need to
-      // reclaim focus when the target differs from source: same-window case
-      // never lost it, and the create-new-window branch above is the one
-      // case that does (a freshly created window is always left focused, so
-      // activateWorkspaceViaMenu's AppleScript -- which acts on the
-      // frontmost window -- has the right target).
-      if (targetWindowId !== sourceWin.id) {
-        await chrome.windows.update(sourceWin.id, { focused: true });
-      }
+      // focusDestination: false -- unlike jumpToTab, this caller doesn't
+      // want to end up looking at the destination. Per Aaron's feedback
+      // (2026-08-14), the old behavior of ending up on the destination
+      // workspace was disorienting for a background move triggered by an
+      // external hotkey. The destination is reachable via the toast below
+      // (or jumpToLastMovedTabs) instead.
+      const moveResult = await moveTabsToWorkspace(selectedTabs, sourceWin.id, ws.id, ws.name, { focusDestination: false });
 
       const result = {
-        ok: true,
-        windowId: targetWindowId,
-        sourceWindowId: sourceWin.id,
-        tabCount: selectedTabs.length,
+        ...moveResult,
         workspaceId: ws.id,
         workspaceName: ws.name,
         workspaceEmoji: ws.emoji,
-        created,
       };
       lastMovedTabs = { workspaceId: ws.id, workspaceName: ws.name, workspaceEmoji: ws.emoji };
       return result;
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
+  // The add-rule dialog's "move this tab now" checkbox (Feature 5) -- moves
+  // one specific tab (the one the dialog was opened for, captured at
+  // showAddRuleDialog time) rather than "whatever's currently selected",
+  // since the dialog can stay open long enough for focus/selection to have
+  // drifted by the time it's submitted. switchTo controls focusDestination
+  // directly: checked means behave like jumpToTab (follow the tab to its
+  // new window); unchecked means behave like moveSelectedTabsToWorkspace
+  // (stay put, same as the external-hotkey move).
+  async function moveTabForRuleDialog(tabId, workspaceId, workspaceName, switchTo) {
+    try {
+      const tab = await getTab(tabId);
+      if (!tab) return { ok: false, reason: "TAB_GONE" };
+      return await moveTabsToWorkspace([tab], tab.windowId, workspaceId, workspaceName, { focusDestination: switchTo });
     } catch (e) {
       return { ok: false, reason: String((e && e.message) || e) };
     }
@@ -786,6 +858,193 @@
   async function jumpToLastMovedTabs() {
     if (!lastMovedTabs) return { ok: false, reason: "NO_RECENT_MOVE" };
     return focusWorkspaceWindow(lastMovedTabs.workspaceId);
+  }
+
+  // ---------- add-a-routing-rule dialog (Feature 5) ----------
+  //
+  // Lets a rule be added for the current tab's domain without ever opening
+  // Settings -> Workspace Rules. Two trigger paths, both funneling into
+  // showAddRuleDialog below: a page context-menu item (click, contexts:
+  // ["all"] -- see createContextMenuItem's own comment for why not "page"),
+  // and a relay endpoint for an external hotkey (keystroke) -- see
+  // connectRelay's "openAddRuleDialog" handler and init()'s contextMenus
+  // setup. The dialog
+  // itself is rendered by window-toast.js (this document has no viewport);
+  // its submission comes back here as a "vwh-add-rule-request" message (see
+  // the runtime.onMessage listener in init()).
+  function getWorkspaceListForDialog() {
+    if (!workspaceStore) return [];
+    return workspaceStore.getWorkspaces().map((w) => ({ id: w.id, name: w.name, emoji: w.emoji }));
+  }
+
+  // Strips a leading "www." from the domain used to pre-fill the rule's
+  // expression -- per Aaron's request (2026-08-25): a CONTAINS rule for
+  // "example.com" also matches "www.example.com", but not the reverse, so
+  // defaulting to the bare domain makes the rule work regardless of
+  // whether the site is later reached with or without that prefix. Scoped
+  // to just this dialog's pre-fill, not getDomain itself -- the toast's own
+  // display use of getDomain is purely informational, not a matching
+  // expression, so it has no reason to share this.
+  function stripWwwPrefix(domain) {
+    return domain.replace(/^www\./i, "");
+  }
+
+  function showAddRuleDialog(windowId, tab) {
+    chrome.runtime.sendMessage({
+      type: "vwh-show-add-rule-dialog",
+      displayWindowId: windowId,
+      domain: stripWwwPrefix(getDomain(tab.url)),
+      workspaces: getWorkspaceListForDialog(),
+      tabId: tab.id,
+    });
+  }
+
+  // Only ever called with type "CONTAINS" today (the dialog doesn't expose
+  // STARTSWITH/EQUALS) -- kept as a parameter rather than hardcoded since
+  // linkRoutesController.findMatch already supports all three and a future
+  // dialog revision may want to expose the choice.
+  async function addWorkspaceRule(type, expression, workspaceId) {
+    if (!linkRoutesController) return { ok: false, reason: "CONTROLLER_UNAVAILABLE" };
+    if (!expression) return { ok: false, reason: "EMPTY_EXPRESSION" };
+    try {
+      const id = await linkRoutesController.addLinkRoutingRule(type, expression, workspaceId);
+      return { ok: true, id };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
+  // chrome.contextMenus isn't necessarily available yet the instant init()
+  // runs -- confirmed live (2026-08-24): waitForReady only gates on
+  // chrome.tabs and window.webpackChunkgapp_browser_react, and
+  // chrome.contextMenus can still lag behind those by the time this code
+  // runs. Worse, confirmed live via a tight external poll (2026-08-24):
+  // even once create() succeeds with no lastError, the item can still get
+  // silently wiped moments later (observed: present ~1.5s after Vivaldi
+  // launch, gone by ~1.8s, never coming back on its own) -- some part of
+  // Vivaldi's own startup sequence clears extension-registered context menu
+  // items shortly after this script runs, a one-time event rather than an
+  // ongoing block (nothing re-wipes it once re-created after that window
+  // has passed). CONTEXT_MENU_RETRY_DELAYS_MS re-creates on a schedule
+  // chosen to comfortably straddle that observed ~300ms wipe window, then
+  // gives up -- registerContextMenuListener (added exactly once, separate
+  // from the item itself) keeps working across every recreation.
+  let contextMenuListenerAdded = false;
+  const CONTEXT_MENU_ID = "vwh-add-rule";
+  // Leading "+" (ASCII 0x2B, sorts before digits and letters -- chosen
+  // over "!" per Aaron's request for something less alarm-looking, still
+  // low enough to sort first, and thematically fitting since the action
+  // creates something new) pushes this item to the top of the extensions
+  // section of the menu -- confirmed live (2026-08-25) that same-section
+  // extension menu items are ordered alphabetically by title, not by
+  // extension id or install order: with the plain title "Route this
+  // site...", it landed exactly where alphabetical order predicts (between
+  // "Rich URL" and "Save Page to Reader"), per Aaron's screenshot. A
+  // fancier prefix like "🔀" was considered and rejected -- its Unicode
+  // code point is far higher than any Latin letter, so it would sort to
+  // the *bottom* of the extensions group instead, undoing this fix. There's
+  // no way to place the item *before* the separator alongside Vivaldi's
+  // own native items (e.g. "Copy Page Address") either -- that boundary
+  // between native and extension-added items is drawn by the browser
+  // itself and isn't something the contextMenus API can override. A
+  // per-item custom icon isn't achievable at all -- create() rejects an
+  // `icons` property outright ("Unexpected property: 'icons'") in this
+  // Vivaldi build, confirmed live the same session.
+  // "Create workspace rule" (not "Route to workspace") matches Vivaldi's
+  // own Settings terminology ("Workspace Rules") -- adopted throughout
+  // this feature's user-facing text per Aaron's request.
+  const CONTEXT_MENU_TITLE = "+ Create workspace rule for this site…";
+  const CONTEXT_MENU_RETRY_DELAYS_MS = [300, 800, 1500, 3000, 6000];
+
+  function createContextMenuItem() {
+    // "all" (not "page") -- confirmed live (2026-08-25) that right-clicking
+    // directly on text puts Chrome into a "selection" context, which a
+    // "page"-only item does not appear in. Most of a real page IS text, so
+    // "page"-only meant the item was effectively hidden for the common case
+    // of right-clicking near/on content -- only a genuinely blank-background
+    // right-click ever showed it. "all" covers selection/link/image/etc. too.
+    chrome.contextMenus.create(
+      { id: CONTEXT_MENU_ID, title: CONTEXT_MENU_TITLE, contexts: ["all"] },
+      () => {
+        // "duplicate id" just means a previous attempt's item is still
+        // there -- not an error worth logging.
+        const err = chrome.runtime.lastError;
+        if (err && !/duplicate id/i.test(err.message)) console.warn(TAG, "contextMenus.create:", err.message);
+      }
+    );
+  }
+
+  // Re-verifies the item exists and recreates it if not -- shared by the
+  // bounded startup retries and the post-click recheck below, both of
+  // which just want "make sure it's actually there right now" without
+  // caring which of the (possibly several) wipe triggers caused it to go
+  // missing.
+  function ensureContextMenuItem() {
+    chrome.contextMenus.update(CONTEXT_MENU_ID, {}, () => {
+      if (chrome.runtime.lastError) createContextMenuItem();
+    });
+  }
+
+  function registerContextMenuListener() {
+    if (contextMenuListenerAdded) return;
+    contextMenuListenerAdded = true;
+    // Doesn't use the `tab` argument onClicked is documented to pass --
+    // confirmed live (2026-08-25) that it comes through as undefined for a
+    // real click in this context (menuItemId/info are fine; only the
+    // second argument is missing), silently dropping every click under the
+    // old `tab &&` guard. Falls back to the exact same focused-window/
+    // active-tab resolution the relay path already uses successfully.
+    chrome.contextMenus.onClicked.addListener((info) => {
+      if (info.menuItemId !== CONTEXT_MENU_ID) return;
+      openAddRuleDialogForFocusedWindow();
+      // Confirmed live (2026-08-25, reported by Aaron): the item can go
+      // missing after being used once -- re-verify shortly after every
+      // click in case USE itself is the wipe trigger. This only ever fires
+      // on an actual click of this specific item (onClicked doesn't fire
+      // for ordinary page clicks at all), so it's cheap and rare by
+      // construction -- deliberately not paired with an always-on
+      // periodic timer, since there's no evidence yet of a wipe that
+      // happens independent of a click to justify that ongoing cost.
+      setTimeout(ensureContextMenuItem, 500);
+    });
+  }
+
+  function verifyContextMenuItem(retryIndex) {
+    chrome.contextMenus.update(CONTEXT_MENU_ID, {}, () => {
+      if (!chrome.runtime.lastError) return; // still there, nothing to do
+      if (retryIndex >= CONTEXT_MENU_RETRY_DELAYS_MS.length) return; // out of retries -- the post-click recheck is what's left to catch a later wipe
+      setTimeout(() => {
+        createContextMenuItem();
+        verifyContextMenuItem(retryIndex + 1);
+      }, CONTEXT_MENU_RETRY_DELAYS_MS[retryIndex]);
+    });
+  }
+
+  function registerContextMenu(pollAttempt) {
+    pollAttempt = pollAttempt || 0;
+    if (typeof chrome === "undefined" || !chrome.contextMenus) {
+      if (pollAttempt > 50) {
+        console.error(TAG, "chrome.contextMenus never became available -- add-rule context menu item unavailable.");
+        return;
+      }
+      setTimeout(() => registerContextMenu(pollAttempt + 1), 100);
+      return;
+    }
+    registerContextMenuListener();
+    createContextMenuItem();
+    setTimeout(() => verifyContextMenuItem(0), CONTEXT_MENU_RETRY_DELAYS_MS[0]);
+  }
+
+  // Relay path (external hotkey): shows the dialog for whichever tab is
+  // active in the currently focused window, same "what am I looking at right
+  // now" semantics as jumpToLastRoutedTab/moveSelectedTabsToWorkspace.
+  async function openAddRuleDialogForFocusedWindow() {
+    const win = await new Promise((resolve) => chrome.windows.getLastFocused({ populate: true }, resolve));
+    if (!win) return { ok: false, reason: "NO_FOCUSED_WINDOW" };
+    const activeTab = (win.tabs || []).find((t) => t.active);
+    if (!activeTab) return { ok: false, reason: "NO_ACTIVE_TAB" };
+    showAddRuleDialog(win.id, activeTab);
+    return { ok: true };
   }
 
   function requestActivateWorkspace(workspaceName) {
@@ -846,6 +1105,11 @@
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }
+      if (msg.type === "openAddRuleDialog") {
+        const result = await openAddRuleDialogForFocusedWindow();
+        socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
+        return;
+      }
       if (msg.requestId != null && pendingRelayRequests.has(msg.requestId)) {
         const resolve = pendingRelayRequests.get(msg.requestId);
         pendingRelayRequests.delete(msg.requestId);
@@ -878,6 +1142,15 @@
       window.__vwh_req = req; // expose for manual inspection
       return;
     }
+    // Non-fatal if this one fails -- the rest of the feature set (jump,
+    // move-to-workspace) doesn't depend on it. Only the add-rule dialog does
+    // (addWorkspaceRule checks linkRoutesController itself and reports
+    // CONTROLLER_UNAVAILABLE rather than throwing).
+    if (!resolveLinkRoutesController(req)) {
+      console.error(TAG, "Link-routes controller module resolution failed -- add-rule dialog will be unavailable.");
+    }
+
+    registerContextMenu();
 
     chrome.tabs.onCreated.addListener((tab) => {
       tabOriginalActiveState.set(tab.id, tab.active);
@@ -948,6 +1221,45 @@
           if (!result.ok) console.error(TAG, "focusWorkspaceWindow failed:", result.reason, message);
         });
       }
+      // Sent by window-toast.js's add-rule dialog on submit (see
+      // showAddRuleDialog above). Echoes back displayWindowId/workspaceName/
+      // workspaceEmoji purely for the confirmation toast below -- the actual
+      // rule creation only needs ruleType/expression/workspaceId.
+      // moveNow/switchTo/tabId drive the dialog's "move this tab now" and
+      // "...and switch to that workspace" checkboxes -- the rule is always
+      // added regardless of those; the move is additional behavior on top.
+      if (message.type === "vwh-add-rule-request") {
+        (async () => {
+          const result = await addWorkspaceRule(message.ruleType || "CONTAINS", message.expression, message.workspaceId);
+          if (!result.ok) {
+            console.error(TAG, "addWorkspaceRule failed:", result.reason, message);
+            return;
+          }
+          let moveResult = null;
+          if (message.moveNow && message.tabId != null) {
+            moveResult = await moveTabForRuleDialog(message.tabId, message.workspaceId, message.workspaceName, !!message.switchTo);
+            if (!moveResult.ok) console.error(TAG, "moveTabForRuleDialog failed:", moveResult.reason, message);
+          }
+          const moved = !!(moveResult && moveResult.ok);
+          const switched = moved && !!message.switchTo;
+          // If the move switched to the destination, that window is what's
+          // now on screen -- show the confirmation there (mirrors
+          // showJumpedToast's use of result.windowId over the original
+          // window), not on the source window the dialog was opened from.
+          const toastWindowId = switched ? moveResult.windowId : message.displayWindowId;
+          chrome.runtime.sendMessage({
+            type: "vwh-show-toast",
+            variant: "rule-added",
+            displayWindowId: toastWindowId,
+            workspaceId: message.workspaceId,
+            workspaceName: message.workspaceName,
+            workspaceEmoji: message.workspaceEmoji,
+            domain: message.expression,
+            moved,
+            switched,
+          });
+        })();
+      }
     });
 
     refreshFocusedWorkspaceBaseline();
@@ -966,6 +1278,9 @@
       get lastMovedTabs() {
         return lastMovedTabs;
       },
+      linkRoutesController,
+      addWorkspaceRule,
+      openAddRuleDialogForFocusedWindow,
     };
     console.log(TAG, "Ready");
   }

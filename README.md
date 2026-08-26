@@ -188,7 +188,11 @@ the History menu.
 - `vivaldi://inspect/#apps` → a specific open window → inspect, for
   `[VWH-toast]`-prefixed logs (Feature 2's toast itself).
 - `window.__vwh` is exposed at runtime in `main.html`'s console:
-  `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`.
+  `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`,
+  `__vwh.linkRoutesController` (Feature 5's rules API, `.getRules()`/
+  `.addLinkRoutingRule(type, expression, workspaceId)`/
+  `.removeLinkRoutingRules(ids)`), `__vwh.addWorkspaceRule(...)`,
+  `__vwh.openAddRuleDialogForFocusedWindow()`.
 - Relay connection state/errors: `~/Library/Logs/vivaldi-workspace-relay.log`.
 
 ---
@@ -355,13 +359,115 @@ a per-move basis.
 
 ---
 
+## Feature 5: create a workspace rule from inside the browser
+
+Lets you add a workspace rule (Settings → Workspace Rules' "open websites
+in workspaces automatically" list) for the current domain without ever
+opening Settings. Two ways to bring up the dialog:
+
+- **Right-click any page** → "Create workspace rule for this site…" (works
+  right-clicking on text, links, images, etc., not just blank background —
+  see the note below on why that needed a fix. Not available by
+  right-clicking the *tab* itself — confirmed live that Vivaldi's tab-strip
+  menu isn't extension-augmentable at all, see `CLAUDE.md`)
+- **An external hotkey**, same relay pattern as the other features:
+  ```
+  GET http://127.0.0.1:8877/open-add-rule-dialog
+  ```
+  (opens the dialog for the active tab in Vivaldi's currently focused
+  window — bind it the same way as Feature 2's external hotkey above, e.g.
+  via macOS Shortcuts.app)
+
+Either way, a "Create workspace rule" dialog appears **centered on the
+window**, pre-filled with the current tab's domain (a leading `www.` is
+stripped, so the rule also matches the site without that prefix) and a
+list of your workspaces below it. Click a workspace to create the rule
+immediately — no separate "Add" button, since picking the workspace *is*
+the submission. Clicking outside the dialog cancels without creating
+anything (Escape does *not* dismiss it — confirmed live that Vivaldi
+doesn't deliver Escape, Enter, Space, or the arrow keys to this dialog's JS
+at all, so click-away is the only way).
+
+**Keyboard shortcuts** (letters only, since the keys above are all
+off-limits — each hinted inline via a "(X)" in its own label or, for j/k,
+next to the "(W)orkspace:" header): `j`/`k` move the highlighted workspace
+down/up (the first workspace is pre-selected when the dialog opens),
+`(U)RL` (or the ✎ button) focuses the domain field, `(W)orkspace` returns
+focus to the list and re-selects the first entry, `(M)ove`/`(O)pen` toggle
+the two checkboxes below, and `(C)ancel`/`(S)ave new Rule` — a row at the
+bottom of the dialog — back out or finish, the closest available
+equivalent to Escape/Enter (which don't reach this dialog at all). Tab also
+cycles focus through the list, the two checkboxes, and the URL field in
+that order — though whether Tab actually reaches this dialog at all hasn't
+been confirmed yet, unlike the letter keys (see `CLAUDE.md`). All of the
+letter shortcuts are inert while you're actively typing in the domain
+field, so a domain containing one of these letters is never mistaken for a
+shortcut.
+
+**"Also (M)ove this tab now"** — checkbox below the workspace list. When
+checked, submitting also moves the current tab to the chosen workspace
+immediately (not just future navigations). A second, indented checkbox —
+**"...and (O)pen that workspace"** — only enabled when the first is
+checked, controls whether you follow the tab there or stay put (same "stay
+on the source window" behavior as Feature 4's move). Both checkboxes are
+sticky — they remember their last state across dialog opens and even
+Vivaldi restarts.
+
+A confirmation toast ("Rule created: `<domain>` → `<emoji>` `<name>`",
+plus "Tab moved" if applicable) appears on success — interactive
+(click-to-switch) if the tab moved but you didn't switch to it, otherwise
+just informational.
+
+Needs the same install as Features 1 & 2 (`injected/install.sh` + the
+relay) — nothing extra to install.
+
+**How it works, and why it doesn't need any UI automation.** Unlike
+workspace *assignment* (Feature 3/4's territory, which genuinely has no
+extension API and has to drive Vivaldi's own Window menu via AppleScript),
+routing rules turned out to have a real one: reading the actual
+`Preferences` file on disk shows rules live at
+`vivaldi.workspaces.link_routes` as `{id, type, expression, workspaceId}`
+entries, and the same webpack-module-scanning technique this project
+already uses for `workspaceStore` (see `CLAUDE.md`) finds a sibling
+"link-routes controller" module exposing `addLinkRoutingRule(type,
+expression, workspaceId)`. Calling it dispatches the identical Redux action
+Vivaldi's own Settings page uses, which updates the live rule state
+immediately and persists to `Preferences` on Chromium's normal (debounced)
+schedule — confirmed via a scripted add/remove/re-read of the real
+`Preferences` file. `type` is always `"CONTAINS"` for rules added through
+this dialog (matching what a plain domain-only rule looks like when added
+through Settings); `STARTSWITH`/`EQUALS` aren't exposed in the UI.
+
+**Why the right-click item needed to cover more than "page".** Right-clicking
+directly on text (rather than blank background) puts Chrome into a
+`"selection"` context rather than `"page"` — confirmed live that a
+`"page"`-only menu item simply doesn't appear there, which in practice made
+it show up only when right-clicking genuinely empty space on a page (rare,
+since most pages are mostly text). Fixed by registering the item for `"all"`
+contexts instead.
+
+**Two Vivaldi quirks, worked around automatically.** The context-menu item
+can get silently wiped moments after this script first creates it —
+confirmed live via a tight polling test: present ~1.5s after launch, gone
+by ~1.8s, seemingly cleared by some part of Vivaldi's own startup sequence
+finishing after this script's own (very early) init runs. A short retry
+schedule re-verifies and re-creates the item until it sticks. Separately,
+it can also disappear again well after startup — confirmed live after a
+single real use — so every click of the item is also followed by one more
+quiet re-check shortly after, just in case using it is (part of) what
+triggers that. Neither needs any configuration or should be noticeable.
+
+---
+
 ## Uninstalling
 
-- Features 1, 2 & 4: delete the `<script>` tags injected into `main.html`/
-  `window.html` (re-running `install.sh` after removing the source files
-  will fail — easiest is to reinstall/repair Vivaldi, or manually edit those
-  two HTML files), `launchctl unload` + remove the LaunchAgent plist, remove
-  the extension via `vivaldi://extensions` if installed, remove any Feature 4
-  Keyboard Maestro macros.
+- Features 1, 2, 4 & 5: delete the `<script>` tags injected into
+  `main.html`/`window.html` (re-running `install.sh` after removing the
+  source files will fail — easiest is to reinstall/repair Vivaldi, or
+  manually edit those two HTML files; this also removes Feature 5's context
+  menu item, since it's registered by the same script), `launchctl unload` +
+  remove the LaunchAgent plist, remove the extension via
+  `vivaldi://extensions` if installed, remove any Feature 4 Keyboard Maestro
+  macros.
 - Feature 3: remove the Keyboard Maestro macros, delete
   `/Applications/Vivaldi Debug.app`, go back to launching Vivaldi normally.

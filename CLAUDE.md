@@ -508,6 +508,320 @@ still being in A. Fixed:
   alongside the per-workspace move macros, for jumping to wherever the last
   move landed without having to still see its toast.
 
+## Fourth feature: add a workspace routing rule from inside the browser (2026-08-24)
+
+A dialog for adding a new "open in workspace" routing rule (Settings →
+Workspace Rules) for the current tab's domain, without ever opening
+Settings — reachable via a page right-click context-menu item or an
+external hotkey through the relay. Unlike workspace *assignment* (the
+Third feature above, and `bridge/workspace-jump.js`'s whole reason for
+existing), this one turned out to have a real API — no AppleScript/menu-
+click automation needed at all.
+
+**Where rules actually live, confirmed by reading the real `Preferences`
+file, not guessed.** `vivaldi.workspaces.link_routes` is an array of
+`{id, type, expression, workspaceId}` entries — `type` is `"CONTAINS"` for
+every rule Aaron had already configured through Settings (the enum also
+supports `"STARTSWITH"`/`"EQUALS"`, per the rules-matching module's own
+`findMatch` switch, but this dialog only ever writes `"CONTAINS"`).
+
+**A real live API for this, found the same way `workspaceStore` was
+found.** Same webpack-module-scanning technique as `resolveWorkspaceStore`
+(push a no-op chunk onto `window.webpackChunkgapp_browser_react` to
+harvest `__webpack_require__`, then scan `req.m` for a signature) —
+`resolveLinkRoutesController` in `workspace-route-watcher.js` searches for
+`"addLinkRoutingRule("` and verifies the resolved module exports that
+method. Confirmed live via a scripted add/remove/re-read of the actual
+`Preferences` file on disk (2026-08-24): calling
+`linkRoutesController.addLinkRoutingRule(type, expression, workspaceId)`
+dispatches the identical Redux action (`"CREATE_WORKSPACE_LINK_ROUTE"`)
+Vivaldi's own Settings page uses — it updates live rule state immediately
+(no restart needed) and persists to `Preferences` on Chromium's own
+debounced pref-write schedule (observed roughly 10-20s after the last
+change in that session, not immediate — a plain add-then-read-the-file
+check can appear to fail if it doesn't wait long enough).
+`removeLinkRoutingRules(ids)` is the mirror, used only for this project's
+own live-testing cleanup, not by the dialog itself.
+
+**Two files, same split as the toast (Second feature above), for the same
+reason** — `main.html` can detect/decide but can't draw anything;
+`window.html` has the viewport:
+
+- `injected/workspace-route-watcher.js` — `showAddRuleDialog(windowId,
+  tab)` resolves the tab's domain (`getDomain`, already used elsewhere in
+  this file) and the full workspace list
+  (`workspaceStore.getWorkspaces()`), then broadcasts
+  `vwh-show-add-rule-dialog` (displayWindowId-gated, same pattern as
+  `vwh-show-toast`). Two triggers, both funneling into this same function:
+  a `chrome.contextMenus` item (`"vwh-add-rule"`, contexts `["all"]` --
+  changed from `["page"]` 2026-08-25 after confirming live that right-clicking
+  directly on text puts Chrome into a `"selection"` context, which a
+  `"page"`-only item never appears in; since most of a real page *is* text,
+  that meant the item was effectively invisible except on genuinely blank
+  background), and `openAddRuleDialogForFocusedWindow()` (reachable via the relay's new
+  `openAddRuleDialog` message type / `GET /open-add-rule-dialog`), which
+  resolves the focused window's active tab itself, same "what am I looking
+  at right now" semantics as `jumpToLastRoutedTab`/
+  `moveSelectedTabsToWorkspace`. The dialog's submission comes back as a
+  `vwh-add-rule-request` message (`ruleType`/`expression`/`workspaceId`,
+  plus `displayWindowId`/`workspaceName`/`workspaceEmoji` echoed purely for
+  the confirmation toast), handled by `addWorkspaceRule`, which shows a new
+  `"rule-added"` toast variant on success.
+- `injected/window-toast.js` — `showAddRuleDialog(message)` renders the
+  actual dialog: an editable text input (pre-filled with the domain) plus a
+  list of workspace buttons (emoji + name). Clicking a workspace both
+  selects it and submits in one action — no separate "Add" button, since
+  the workspace list *is* the set of choices. Centered on the window
+  (changed 2026-08-25 from the toast's top-right-of-viewport anchor, per
+  Aaron's feedback that top-right is also where macOS notifications land
+  and one had partly covered the dialog there).
+  A full-viewport transparent backdrop (`vwh-rule-dialog-backdrop`, click
+  dismisses) gives click-outside-to-cancel without needing a real modal
+  API; `stopPropagation` on the dialog itself keeps clicks inside it from
+  reaching that backdrop. **No Escape-to-dismiss** — an `input`
+  `keydown` listener for it was tried and removed 2026-08-25 after
+  confirming live (a diagnostic `document`-level, capture-phase `keydown`
+  listener that never fired at all) that Escape doesn't reach this
+  document's JS in this context, the same class of finding as the removed
+  in-page ⌥⌘J toast shortcut (see the Second feature section) — just
+  discovered the hard way this time, since the code silently did nothing
+  rather than erroring. The backdrop click is the only reliable dismiss
+  path.
+
+**A one-time Vivaldi-internal race, confirmed via a tight external polling
+test, not assumed.** `chrome.contextMenus` isn't necessarily available the
+instant `init()` runs (`waitForReady` only gates on `chrome.tabs` and
+`window.webpackChunkgapp_browser_react`), but the real surprise went
+further: even after `chrome.contextMenus.create()` succeeds with no
+`lastError`, the item can still get silently wiped moments later.
+Reproduced by polling `chrome.contextMenus.update("vwh-add-rule", {}, …)`
+externally via CDP every ~300ms immediately after a cold Vivaldi launch:
+the item existed at t+1.3s, was gone by t+1.8s, and never came back on its
+own for the rest of a 13-second observation window — some part of
+Vivaldi's own startup sequence (still finishing subsystem init well after
+this script's own, very early `init()` has already run and logged
+`"Ready"` — confirmed via `main.html`'s own startup console log, which
+shows things like `WorkspaceLinkRoutingActions` and `Menu` resolving
+*after* `[VWH] Ready`) appears to clear extension-registered context menu
+items once, but doesn't keep re-clearing them afterward. Fixed with
+`registerContextMenu`/`verifyContextMenuItem`/`createContextMenuItem`: the
+`onClicked` listener is added exactly once
+(`registerContextMenuListener`'s own guard), but the menu item itself is
+created, then re-verified and re-created on a short retry schedule
+(`CONTEXT_MENU_RETRY_DELAYS_MS`, chosen to comfortably straddle the
+observed ~300-500ms wipe window) until it survives a check — confirmed to
+self-heal correctly by rerunning the same tight polling test against the
+fixed code (item survived the same early wipe and stayed present for the
+rest of the observation window).
+
+**Not on the tab itself, confirmed live not to be possible via this
+API.** Aaron asked (2026-08-25) for the entry on the tab (right-click a tab
+in the tab strip) rather than the page background, since that's the more
+natural place to reach for "route this site." Tested directly:
+`chrome.contextMenus.create({..., contexts: ["tab"]})` is accepted with no
+`lastError` at all, but a real right-click on a tab (verified with a
+screenshot after a scripted `cliclick` right-click at the tab's actual
+screen coordinates) shows Vivaldi's own fully native tab context menu (New
+Tab, Reload, Mute, Duplicate, Move, Stack, …) with no trace of the item —
+`"tab"` is silently accepted but not actually wired to anything. Vivaldi's
+tab-strip menu isn't extension-augmentable the way the page context menu
+is; `contexts: ["all"]` (see above) is the closest available fix, since it
+at least makes the item appear reliably no matter what part of the page
+you right-click.
+
+**The `tab` argument `onClicked` is documented to pass isn't reliable
+here, confirmed live with a throwaway diagnostic listener.** Even after
+fixing the contexts above, clicking the real menu item still did nothing —
+no dialog, no error. Added a second `chrome.contextMenus.onClicked`
+listener purely to log its raw arguments: `menuItemId`/`pageUrl`/
+`selectionText` all came through correctly, but the second (`tab`)
+argument was `undefined`. `registerContextMenuListener`'s original code
+had `if (info.menuItemId === "vwh-add-rule" && tab) showAddRuleDialog(tab.windowId, tab)`
+— that `tab &&` guard was silently swallowing every real click. Fixed by
+not depending on that argument at all: the handler now just calls
+`openAddRuleDialogForFocusedWindow()` (the exact same focused-window/
+active-tab resolution the relay path already used successfully), which
+sidesteps the question of why `tab` is missing here entirely.
+
+**Keyboard navigation inside the dialog uses j/k/e/a, not arrows/Enter/
+Escape — confirmed live those aren't deliverable at all (2026-08-25).** A
+diagnostic `document`-level, capture-phase `keydown` listener (the same
+technique used to discover Escape's fate above) never fired even once for
+Arrow-Up/Down, Enter, or Space, sent via real OS-level key events
+(`cliclick`) with the dialog open and focus anywhere (including nothing
+focused) — Vivaldi's own chrome consumes all of them before page JS ever
+sees them, presumably because it always checks those specific keys first
+for its own omnibox-autocomplete navigation. Ordinary letter keys, by
+contrast, were confirmed to reach the same listener reliably regardless of
+focus (typing into the domain field also confirmed to work normally, since
+that's standard `<input>` behavior, not dependent on this). So the
+in-dialog keyboard scheme (per Aaron's request, 2026-08-25) uses letters
+instead: `j`/`k` move the highlighted workspace down/up (wrapping), `e`
+focuses the domain field for editing, `a` accepts the highlighted workspace
+(equivalent to clicking it) — Enter was the first choice but is one of the
+confirmed-undeliverable keys, so a mnemonic letter substitutes for it. A
+visible legend renders in the dialog itself, since none of this is
+otherwise discoverable. The `document`-level keydown listener is added only
+while the dialog is open and removed in `dismissRuleDialog` (a permanent
+global letter-key listener would otherwise break normal typing everywhere
+else); it no-ops whenever `document.activeElement === input`, so typing a
+domain that happens to contain "j"/"k"/"e"/"a" is never intercepted as a
+command. Hovering a workspace with the mouse also moves the keyboard
+selection (`selectedIndex`), so there's only one "current" concept
+regardless of input device.
+
+**"Move this tab now" / "...and switch to that workspace" checkboxes
+(2026-08-25).** Below the workspace list, sticky via `chrome.storage.local`
+(confirmed available in `window.html`'s context; keys `vwhMoveTabNow`/
+`vwhSwitchToWorkspace`) so they persist across dialog opens and Vivaldi
+restarts, read on dialog open and written on `change`. The second
+checkbox is indented and `disabled` unless the first is checked. On submit
+(click, or `a` on the highlighted item), `workspace-route-watcher.js`
+always adds the rule first, then — only if "move now" was checked — calls
+the new `moveTabForRuleDialog(tabId, workspaceId, workspaceName, switchTo)`,
+which moves the *specific* tab the dialog was opened for (its id threaded
+through `showAddRuleDialog` → the `vwh-show-add-rule-dialog` broadcast →
+the dialog's submit message), not "whatever's currently selected" — the
+dialog can stay open long enough for the active tab/selection to have
+drifted, unlike an instant hotkey trigger. `switchTo` maps directly to
+`moveTabsToWorkspace`'s `focusDestination`: checked behaves like
+`jumpToTab` (follow the tab to its new window); unchecked behaves like
+`moveSelectedTabsToWorkspace` (stay on the source window). Both now share
+a `moveTabsToWorkspace(tabs, sourceWindowId, workspaceId, workspaceName,
+{focusDestination})` helper, factored out of what was previously
+`moveSelectedTabsToWorkspace`'s own body — same "resolve/create window,
+recreate tabs there, clean up the leftover default tab, decide whose focus
+wins" logic, just parameterized over which tab(s) and whether to follow.
+The confirmation toast combines both outcomes in one variant
+(`"rule-added"` with `moved`/`switched` flags) rather than stacking two
+separate toasts: no move → unchanged "Routing added: …" text; moved without
+switching → adds "Tab moved — click to switch" and becomes interactive
+(reuses the `"moved-tabs"` `activeTarget` kind, so clicking sends the same
+`vwh-focus-workspace-request`); moved and switched → adds "Tab moved" with
+no click action (and is shown on the *destination* window, not the
+original `displayWindowId`, mirroring `showJumpedToast`'s reasoning — the
+source window isn't what's on screen anymore).
+
+**The context-menu wipe isn't just a one-time startup thing after all,
+confirmed by real use (2026-08-25).** Aaron reported the item worked once,
+then never appeared again on later right-clicks -- the bounded
+`CONTEXT_MENU_RETRY_DELAYS_MS` retry chain (built for the ~300-500ms
+startup wipe) only ever runs for ~12s after Vivaldi launches, so if
+something wipes the item well after that window has closed, nothing was
+left to notice or fix it. Confirmed live: `chrome.contextMenus.update`
+genuinely reported "Cannot find menu item" long after startup, well past
+when the bounded retries had already given up. Fixed with a shared
+`ensureContextMenuItem()` (verify, recreate if missing) called again
+~500ms after every real click, on the theory that use itself is the wipe
+trigger -- the only concrete evidence available points there (it broke
+*after being used*), so that's what the fix targets, rather than adding an
+always-on periodic timer to guard against a wipe with no actual evidence
+it happens independent of a click. Aaron pushed back on an earlier version
+of this fix that also polled every 60s regardless of activity -- fair
+cost/benefit call: `onClicked` only ever fires for an actual click of this
+specific menu item (never for ordinary page clicks), so the click-triggered
+recheck is cheap and rare by construction, while a permanent timer running
+for the entire life of every window is a real ongoing cost paid whether or
+not the bug it guards against ever recurs. If a wipe independent of any
+click ever turns up, that would be the moment to reconsider.
+
+**Menu position and icon, investigated the same session.** Same-section
+extension context-menu items are ordered alphabetically by title, not by
+extension id or install order -- confirmed by Aaron's own screenshot: with
+the plain title "Route this site...", the item landed exactly where
+alphabetical order predicts, between "Rich URL" and "Save Page to Reader".
+`CONTEXT_MENU_TITLE` now leads with `"! "` (ASCII 0x21, sorts before every
+digit and letter) to push it to the top of that section. There is no way
+to place it *before* the separator alongside Vivaldi's own native items
+(e.g. "Copy Page Address") -- that boundary between native and
+extension-added items is drawn by the browser itself, not something the
+contextMenus API can influence at all, so "top of the extensions group" is
+the ceiling here. A per-item custom icon isn't achievable either: passing
+`icons: {...}` to `chrome.contextMenus.create` throws
+`TypeError: ... Unexpected property: 'icons'` outright in this Vivaldi
+build -- confirmed live, not merely undocumented.
+
+**A second, distinct wipe trigger found by real use (2026-08-25): creating
+a new window.** After the post-click recheck above shipped, Aaron still
+lost the item once -- but only on a run where "move this tab now" needed
+to create a brand-new window for the destination workspace; a run that
+targeted an already-open window, and a later run after a full restart,
+didn't reproduce it. `resolveOrCreateWindowForWorkspace`'s
+`chrome.windows.create` branch now also schedules an `ensureContextMenuItem`
+check ~500ms later, the same delay used for the startup wipe and the
+post-click recheck, on the theory that window creation is a second,
+independent trigger, plausible given the already-confirmed startup wipe
+also happens amid a wave of window/subsystem initialization.
+
+**Two dialog bugs found by real use the same session, both now fixed.**
+1. Pressing "u" (then "e") to focus the URL field also *typed* the letter
+   into it, replacing the selected text. Root cause: `input.focus()` ran
+   synchronously inside the keydown handler, but the same keydown event
+   still continued to its default action afterward (nothing had called
+   `preventDefault()`) -- by then focus had already moved to the input, so
+   the browser's default "insert this character" action fired against the
+   newly-focused field instead of wherever focus was before. Every letter
+   handler now starts with `e.preventDefault()` once the key is confirmed
+   to be one of this dialog's own shortcuts.
+2. j/k did nothing at all until Aaron clicked a checkbox first. Root
+   cause: the dialog usually opens while keyboard focus is still on the
+   actual page content, rendered in a `<webview>` that runs in a separate
+   process -- its focus is invisible to this document's own keydown
+   listener entirely (the same cross-process boundary that already killed
+   the in-page toast shortcut, see the Second feature section). A checkbox
+   is a genuinely focusable native element, so clicking one pulled
+   keyboard focus into this document as a side effect; the workspace
+   buttons were plain unstyled `<div>`s, not focusable by default, so
+   clicking one wouldn't have helped. Fixed by giving the dialog container
+   itself `tabIndex = -1` and calling `.focus()` on it the instant it's
+   created, reproducing the same fix without requiring a checkbox click.
+
+**Checkboxes redesigned as fully custom widgets, not styled native ones,
+after two failed rounds of native styling.** Neither the browser's default
+checkbox rendering nor an explicit `accent-color` (tried first) was
+distinguishable checked-vs-unchecked against this dialog's dark background,
+per Aaron's testing both times. `createCheckboxRow` now keeps a real (but
+visually hidden, `opacity:0`/1px) `<input type=checkbox>` purely for
+state/events/tabIndex/disabled -- everything else in the file still reads
+`.checked`/`.disabled` and dispatches synthetic `"change"` events exactly
+as before -- paired with a separate sibling "box" div that renders the
+actual checkmark and background color from scratch, updated by a `syncBox`
+function on every `"change"` event. Setting `.checked` directly (loading
+the sticky value from `chrome.storage.local`) doesn't fire `"change"`, so
+that load path calls `syncBox()` explicitly too.
+
+**Tab-order added, but unverified whether Tab even reaches this document.**
+Per Aaron's request, explicit ascending `tabIndex` values (workspace
+buttons 1..n, then the two checkboxes at 1000/1001, then the URL field at
+1002 despite sitting first in the DOM) now define a specific cycle order
+independent of DOM position. Unlike the letter shortcuts, this needs no
+keydown handling at all -- per-element focus-cycling on Tab is native
+browser behavior, the same category as the input's own left/right-arrow
+text-cursor movement (see the keyboard-navigation comment above), so it
+should work despite Tab being a plausible candidate for the same kind of
+global interception that already claimed Escape/Enter/Space/arrows. This
+hasn't been confirmed live yet either way.
+
+**A visible Cancel/Save row, and an "s" naming collision it created
+(2026-08-25).** Aaron asked for a bottom-right "(C)ancel  (S)ave new Rule"
+row as a discoverable, clickable stand-in for the missing Escape/Enter --
+but "s" already belonged to the switch-to-workspace checkbox. Resolved by
+renaming that checkbox to "...and (O)pen that workspace" (freeing "s" for
+Save) rather than picking a different letter for Save, since Aaron chose
+that resolution directly when asked. `submitAccepted()` was initially
+shared by "a" (the original per-item accept shortcut) and "s"/the Save
+button, kept as two bindings to the same function rather than picking
+one -- but Aaron asked moments later to just remove "a" once "s" existed,
+so it's gone; "s" (and a click, and Tab+`submitAccepted` via the Save
+button) are the only ways to accept now. The rest of the same round was
+pure visual polish, not
+worth a full writeup: the old separate "j/k navigate · a accept" legend
+line was folded into "(W)orkspace:    [j/k navigates]"; the two section
+headers ("(U)RL for rule:", "(W)orkspace:") were made larger than the
+workspace-list items below them rather than smaller; the workspace list
+gained subtle top/bottom border lines; and the checkboxes' text and box
+size were both reduced.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
@@ -517,5 +831,9 @@ still being in A. Fixed:
   `[WTS]`-prefixed ones (the sibling theme-switcher, if also installed).
 - `window.__vwh` is exposed at runtime in `main.html` for live inspection:
   `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`,
-  `__vwh.lastMovedTabs`, `__vwh.jumpToLastMovedTabs()`.
+  `__vwh.lastMovedTabs`, `__vwh.jumpToLastMovedTabs()`, `__vwh.linkRoutesController`
+  (Fourth feature's rules API — `.getRules()` lives on a sibling module, not
+  this one, but `.addLinkRoutingRule(type, expression, workspaceId)`/
+  `.removeLinkRoutingRules(ids)` are here), `__vwh.addWorkspaceRule(...)`,
+  `__vwh.openAddRuleDialogForFocusedWindow()`.
 - Relay logs: `~/Library/Logs/vivaldi-workspace-relay.log`.
