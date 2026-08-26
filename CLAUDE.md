@@ -822,7 +822,65 @@ workspace-list items below them rather than smaller; the workspace list
 gained subtle top/bottom border lines; and the checkboxes' text and box
 size were both reduced.
 
-## Debugging
+
+### Bug found via repeated live use: moving a tab into an *existing* destination window silently auto-jumped there anyway (2026-08-26)
+
+Discovered by Aaron doing exactly the kind of repeated real-world testing
+this project's own live-test methodology relies on: moving the same tab to
+the same workspace twice in a row. The first move (target workspace had no
+window yet) behaved correctly -- stayed on the source window, as designed.
+The second move (same workspace, now with a window from the first move)
+did not: the destination window grabbed focus immediately, and a
+"raised-window" toast fired -- both symptoms belonging to a completely
+different code path (`jumpToTab`, Second feature) than the one that ran
+(`moveTabsToWorkspace`, Third feature), which was the tell that this
+wasn't the keyboard-shortcut work above but a separate, pre-existing bug
+just now getting exercised for the first time.
+
+**Root cause:** `recreateTabInWindow` (the `chrome.tabs.move`-replacement
+technique from the Third feature's "ghost tab" fix) moves a tab by calling
+`chrome.tabs.create()` in the destination window, then removing the
+original. `chrome.tabs.create()` fires `chrome.tabs.onCreated` -- the exact
+event the Second feature's background-tab auto-routing detector listens
+for on *every* new tab, unconditionally. When the destination window is an
+existing one (not freshly created by this same call, which stays
+transiently focused and so reads as "not background" to the detector),
+`moveTabsToWorkspace` deliberately never focuses it -- so 200ms later
+(`BACKGROUND_CHECK_DELAY_MS`), the detector's settle-check sees "a new
+active tab landed in an unfocused window" and treats it exactly like an
+externally-opened tab needing an automatic jump (the Second feature's
+2026-08-10 "foreground-intent" behavior) -- undoing `moveTabsToWorkspace`'s
+whole "stay on the source window" design, deterministically, every time the
+target window already existed (not racy -- a freshly-created target window
+never triggers it, since `chrome.windows.create({})` always leaves it
+transiently focused regardless of what happens after).
+
+**Fix:** `windowsReceivingOwnRecreatedTabs`, a `windowId -> in-flight count`
+Map, checked at the very top of the `chrome.tabs.onCreated` listener and
+skipped entirely for any window it names -- the same "mark our own actions
+so the detector ignores them" pattern `windowsCreatedByJumpToTab` already
+used for `onWorkspaceStoreChanged`. Marked via `markWindowReceivingOwnTab`
+*before* calling `chrome.tabs.create` (not after, from the resolved tab
+id) specifically because `chrome.tabs.create`'s callback isn't guaranteed
+to resolve strictly before its own `onCreated` event reaches the listener
+-- marking first closes that race entirely rather than narrowing it.
+Applied inside `recreateTabInWindow` itself, so it covers both of that
+function's callers (`jumpToTab` and `moveTabsToWorkspace`) uniformly, even
+though the bug was only ever observed via the latter.
+
+**Verified live, 2026-08-26**, via the real `/move-selected-tabs-to-workspace`
+relay endpoint (not a synthetic message) against a real workspace with no
+window yet, then again against the window that move had just created --
+the second call, the exact reused-window condition that triggered the bug,
+came back with the correct `"moved-tabs"` toast text and left the source
+window focused. (A second, broader repro attempt collided with Aaron
+moving real windows to another screen mid-test -- its results were
+discarded as unreliable rather than trusted, since the test's own
+"currently focused window" assumption no longer matched what was actually
+focused by the time each step ran, and it may have moved an already-open
+real tab into an unexpected workspace window as a result -- flagged to
+Aaron rather than guessed at or auto-"fixed.")
+
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
   a specific window's entry (for its toast) → **inspect**. Watch for

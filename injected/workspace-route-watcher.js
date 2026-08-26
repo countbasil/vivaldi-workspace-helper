@@ -482,6 +482,35 @@
   // doc's 2026-08-12 section.
   const windowsCreatedByJumpToTab = new Set();
 
+  // windowId -> count of recreateTabInWindow calls currently in flight for
+  // that window. recreateTabInWindow (below) does chrome.tabs.create() to
+  // move a tab into a window -- a deliberate workaround for chrome.tabs.move
+  // being unreliable here (see that function's own comment) -- but create()
+  // fires chrome.tabs.onCreated, the exact same event the background-tab
+  // auto-routing detector below listens for. Confirmed live (2026-08-26):
+  // when the destination window was already open (not newly created by this
+  // same operation, which stays transiently focused and so reads as "not
+  // background"), moveTabsToWorkspace's recreated tab got misread as an
+  // externally-opened foreground-intent tab, triggering an automatic
+  // jumpToTab straight back to the window this was supposed to leave
+  // unfocused -- undoing moveTabsToWorkspace's whole "stay on the source
+  // window" design and firing a spurious "raised-window" toast, every time
+  // (not racy) once the target window already existed. Marked *before*
+  // calling chrome.tabs.create, not after from the resolved tab id, so
+  // there's no window where onCreated could fire before the mark exists --
+  // chrome.tabs.create's own callback isn't guaranteed to resolve strictly
+  // before the onCreated event reaches this listener.
+  const windowsReceivingOwnRecreatedTabs = new Map();
+
+  function markWindowReceivingOwnTab(windowId) {
+    windowsReceivingOwnRecreatedTabs.set(windowId, (windowsReceivingOwnRecreatedTabs.get(windowId) || 0) + 1);
+  }
+  function unmarkWindowReceivingOwnTab(windowId) {
+    const remaining = (windowsReceivingOwnRecreatedTabs.get(windowId) || 1) - 1;
+    if (remaining <= 0) windowsReceivingOwnRecreatedTabs.delete(windowId);
+    else windowsReceivingOwnRecreatedTabs.set(windowId, remaining);
+  }
+
   let lastKnownFocusedWorkspaceId; // undefined until first computed in init()
 
   function refreshFocusedWorkspaceBaseline() {
@@ -662,14 +691,22 @@
   // form input) -- real costs, but far smaller than landing a tab you can
   // never get back to.
   async function recreateTabInWindow(tab, windowId, active) {
-    const newTab = await callChrome(chrome.tabs, "create", {
-      windowId,
-      url: tab.url,
-      active: !!active,
-      pinned: tab.pinned,
-    });
-    await callChrome(chrome.tabs, "remove", tab.id);
-    return newTab.id;
+    markWindowReceivingOwnTab(windowId);
+    try {
+      const newTab = await callChrome(chrome.tabs, "create", {
+        windowId,
+        url: tab.url,
+        active: !!active,
+        pinned: tab.pinned,
+      });
+      await callChrome(chrome.tabs, "remove", tab.id);
+      return newTab.id;
+    } finally {
+      // The onCreated listener's check is synchronous at the top of its own
+      // callback, so the mark really only needs to outlive that one event --
+      // this delay is generous insurance, not a measured requirement.
+      setTimeout(() => unmarkWindowReceivingOwnTab(windowId), 1000);
+    }
   }
 
   // The routed tab is then moved into whichever window that resolves to.
@@ -1153,6 +1190,11 @@
     registerContextMenu();
 
     chrome.tabs.onCreated.addListener((tab) => {
+      // Our own recreateTabInWindow (jumpToTab, moveTabsToWorkspace) landing
+      // a tab it created itself -- not a real external/background route. See
+      // windowsReceivingOwnRecreatedTabs's own comment for the bug this
+      // avoids re-triggering.
+      if (windowsReceivingOwnRecreatedTabs.has(tab.windowId)) return;
       tabOriginalActiveState.set(tab.id, tab.active);
       setTimeout(() => tabOriginalActiveState.delete(tab.id), 15000);
 
