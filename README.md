@@ -5,8 +5,9 @@ one quickly and safely — its own per-workspace shortcut can silently
 reassign whatever window is currently focused, hiding tabs you didn't mean
 to touch (see the planning doc's "Rejected approach" section for why that
 ruled out the obvious Keyboard Maestro + built-in-shortcut approach). This
-project is three features that each solve a different piece of "get me to
-the right workspace window without that happening":
+project is five features that each solve a different piece of "get me to
+the right workspace window without that happening", plus a sixth, related
+but separate per-workspace convenience:
 
 - **Feature 1 — auto-jump for externally-opened routed tabs.** A link opened
   from another app (or similar) that Vivaldi's "open websites in workspaces
@@ -37,13 +38,23 @@ the right workspace window without that happening":
   Vivaldi — bind `Ctrl+Shift+<N>` (or whatever) via Keyboard Maestro to move
   whatever tab(s) are currently selected to a named workspace, creating and
   assigning a window for it first if none exists yet.
+- **Feature 5 — create a workspace rule from inside the browser.**
+  Right-click any page (or trigger an external hotkey) to add a new "open in
+  workspace" routing rule for its domain, without ever opening Settings →
+  Workspace Rules — with an option to also move the current tab there
+  immediately.
+- **Feature 6 — per-workspace new-tab-page override.** Give one or two
+  specific workspaces their own Cmd+T destination — e.g. the "Claude"
+  workspace always opening `claude.ai` — instead of Vivaldi's single global
+  New Tab Page setting.
 
 Features 1 and 2 are two branches of the same underlying detection code and
-share one install step. Feature 4 reuses that same install (just a different
-relay endpoint) — see its own section below for the Keyboard Maestro setup.
-Feature 3 is a separate, older mechanism (CDP instead of injected page JS)
-with its own install step. All four can be installed independently of each
-other.
+share one install step. Features 4, 5 & 6 reuse that same install (just
+different relay endpoints, or in Feature 6's case a source-edited constant)
+— see each one's own section below for setup. Feature 3 has two paths: a
+relay-based one (recommended) that reuses that same install, and an older,
+separate CDP-based mechanism with its own install step. All of these can be
+installed independently of each other.
 
 For the full design rationale (including a rejected first approach and every
 bug found along the way), see
