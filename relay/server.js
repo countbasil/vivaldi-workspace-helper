@@ -42,6 +42,19 @@
 //        side. Bind to an external hotkey the same way as the other
 //        endpoints above -- see CLAUDE.md's "Triggering a jump from outside
 //        Vivaldi" section for the recommended macOS Shortcuts.app setup.
+//   GET  http://127.0.0.1:<port>/jump-to-workspace?workspace=<name>
+//        -- focuses the window currently showing the named workspace, or
+//        creates a new blank window and assigns it there if none exists yet.
+//        This is bridge/workspace-jump.js's entire job (CDP + the
+//        --remote-debugging-port-only Debug launcher), reimplemented on this
+//        relay instead: same {ok:false, reason:"MISSING_WORKSPACE_PARAM"}
+//        (400) if the query param is absent, {reason:"UNKNOWN_WORKSPACE"}
+//        from the page side if the name doesn't match any configured
+//        workspace, plus the usual NOT_CONNECTED/TIMEOUT. Response on
+//        success: {ok:true, windowId:…, created:…, workspaceId:…,
+//        workspaceName:…}. Lets a per-workspace hotkey macro (e.g. Keyboard
+//        Maestro) drop the CDP bridge script entirely -- Vivaldi no longer
+//        needs to run with the debug port at all for this.
 //
 // Also handles a message *from* the browser side, {type:"activateWorkspace",
 // requestId, workspaceName}: bringing a workspace on screen has no JS API
@@ -132,6 +145,15 @@ function handleOpenAddRuleDialog(res) {
   sendBrowserRequest(res, { type: "openAddRuleDialog" });
 }
 
+function handleJumpToWorkspace(res, workspaceName) {
+  if (!workspaceName) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, reason: "MISSING_WORKSPACE_PARAM" }));
+    return;
+  }
+  sendBrowserRequest(res, { type: "jumpToWorkspace", workspaceName });
+}
+
 const server = http.createServer((req, res) => {
   const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
   if (req.method === "GET" && parsed.pathname === "/jump-last-routed") {
@@ -145,6 +167,9 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && parsed.pathname === "/open-add-rule-dialog") {
     return handleOpenAddRuleDialog(res);
+  }
+  if (req.method === "GET" && parsed.pathname === "/jump-to-workspace") {
+    return handleJumpToWorkspace(res, parsed.searchParams.get("workspace"));
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not found");

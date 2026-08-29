@@ -32,6 +32,20 @@
 // via a page context-menu item or an external hotkey through the relay. See
 // the "add-a-routing-rule dialog" section below and resolveLinkRoutesController.
 //
+// And a fourth external-hotkey action, jumpToWorkspace (GET
+// /jump-to-workspace on the relay): jump straight to a named workspace,
+// same as any of the above but with no tab/route context at all -- this is
+// bridge/workspace-jump.js's entire job, reimplemented here so a
+// per-workspace hotkey macro no longer needs --remote-debugging-port or the
+// Vivaldi Debug.app launcher at all. Reuses resolveOrCreateWindowForWorkspace,
+// the exact same "find or create the one window for this workspace" step
+// jumpToTab and moveTabsToWorkspace already share.
+//
+// A sixth, unrelated capability lives here too: NEW_TAB_OVERRIDES lets one
+// or two specific workspaces get their own Cmd+T destination (e.g. the
+// "Claude" workspace always opening claude.ai) instead of Vivaldi's single
+// global New Tab Page setting -- see redirectNewTabIfConfigured below.
+//
 // HOW MODULE DISCOVERY WORKS
 // --------------------------
 // Same technique as custom.js and bridge/workspace-jump.js: push a no-op
@@ -74,6 +88,17 @@
   // event) has time to land before we compare against stale focus state.
   const BACKGROUND_CHECK_DELAY_MS = 200;
   const RELAY_REQUEST_TIMEOUT_MS = 5000;
+  // Per-workspace new-tab-page override (Sixth feature, 2026-08-29) --
+  // Vivaldi only has one global "New Tab Page" setting (Settings -> Tabs),
+  // no per-workspace equivalent. Keyed by workspace *name* (like
+  // findWorkspaceByName elsewhere in this file), not id -- names are this
+  // codebase's existing identifier for "which workspace do you mean" in
+  // every hand-configured spot. Only workspaces listed here are affected;
+  // everywhere else, Vivaldi's own New Tab Page setting is untouched. Edit
+  // this map and re-run injected/install.sh + restart Vivaldi to apply.
+  const NEW_TAB_OVERRIDES = {
+    Claude: "https://claude.ai",
+  };
 
   let workspaceStore = null;
   let linkRoutesController = null;
@@ -206,6 +231,58 @@
       console.warn(TAG, "findWorkspaceIdForWindow error:", e);
     }
     return null;
+  }
+
+  // ---------- per-workspace new-tab-page override ----------
+  //
+  // Redirects a brand-new blank tab to NEW_TAB_OVERRIDES[workspaceName], if
+  // one is configured for whichever workspace the tab's window is currently
+  // displaying. "Blank" needs TWO signatures, not one -- confirmed live
+  // (2026-08-29) that a synthetic chrome.tabs.create({}) via CDP (what the
+  // first version of this feature was tested against) and a genuine Cmd+T
+  // keystroke are NOT the same underlying call in this Vivaldi build, despite
+  // looking like they should be: the synthetic one reports
+  // pendingUrl:"chrome://newtab/", settling to url:"chrome://newtab/"
+  // (Chromium's own extension-API default when no url is given); a real
+  // keystroke instead reports pendingUrl:"about:blank", settling to a
+  // permanent url:"about:blank", status:"complete" -- Vivaldi renders its
+  // Speed Dial as an in-page overlay on top of that without ever navigating
+  // the tab's actual url. The first version of this feature only matched
+  // "chrome://newtab/" and so silently never fired for a real Cmd+T at all --
+  // caught only because Aaron tried it live and it didn't work; the CDP test
+  // that "confirmed" it during development was testing the wrong trigger.
+  // Both URL strings are matched now, on both pendingUrl and url (covers the
+  // listener firing at either point in either path). Uses the *window's*
+  // currently displayed workspace (findWorkspaceIdForWindow), not the new
+  // tab's own vivExtData -- what matters here is "what workspace was I
+  // looking at when I pressed Cmd+T", the same question
+  // onWorkspaceStoreChanged already answers elsewhere in this file, not the
+  // tab-vs-window distinction the big header comment warns about for
+  // *routed* tabs (which is about a tab's own membership possibly disagreeing
+  // with its window -- not applicable to a tab that was just born in this
+  // window and has no membership of its own yet).
+  const BLANK_NEW_TAB_URLS = new Set(["chrome://newtab/", "about:blank"]);
+  function redirectNewTabIfConfigured(tab) {
+    // "about:blank" is a much more generic signal than "chrome://newtab/"
+    // was on its own -- a page's own window.open() call (no URL yet,
+    // navigated moments later by that page's own JS, e.g. an OAuth popup)
+    // also starts as about:blank, and this redirect would otherwise race
+    // that and hijack it. chrome.tabs.Tab.openerTabId is standard,
+    // documented Chromium extension-API behavior (not a Vivaldi-specific
+    // quirk needing live reverse-engineering, unlike most of this file): set
+    // whenever a tab was opened by another tab's script, absent for a
+    // genuine Cmd+T/New Tab click. Excluding anything with an opener keeps
+    // this scoped to tabs the *user* opened blank, not a page opening one
+    // for its own purposes.
+    if (tab.openerTabId != null) return;
+    if (!BLANK_NEW_TAB_URLS.has(tab.pendingUrl) && !BLANK_NEW_TAB_URLS.has(tab.url)) return;
+    const workspaceId = findWorkspaceIdForWindow(tab.windowId);
+    if (workspaceId == null) return;
+    const ws = workspaceStore.getWorkspaceById(workspaceId);
+    if (!ws) return;
+    const overrideUrl = NEW_TAB_OVERRIDES[ws.name];
+    if (!overrideUrl) return;
+    chrome.tabs.update(tab.id, { url: overrideUrl });
   }
 
   function getDomain(url) {
@@ -754,6 +831,29 @@
     return workspaces.find((w) => w.name === name) || null;
   }
 
+  // Mirrors bridge/workspace-jump.js's entire job (the CDP-based
+  // per-workspace hotkey, requiring --remote-debugging-port) via the relay
+  // instead -- no tab is involved at all here, unlike jumpToTab, so this is
+  // just resolveOrCreateWindowForWorkspace on its own. A brand-new window's
+  // own default blank tab is deliberately left in place rather than cleaned
+  // up (unlike jumpToTab/moveTabsToWorkspace, which close it once a real tab
+  // has landed) -- that leftover blank tab is exactly what
+  // bridge/workspace-jump.js's own ASSIGNED branch already produces
+  // (chrome.windows.create({}) then just assigning the workspace, nothing
+  // loaded into it). Reachable only via the relay (see connectRelay below)
+  // -- there's no in-page trigger for "just go to workspace N", same as
+  // moveSelectedTabsToWorkspace.
+  async function jumpToWorkspace(workspaceName) {
+    try {
+      const ws = findWorkspaceByName(workspaceName);
+      if (!ws) return { ok: false, reason: "UNKNOWN_WORKSPACE" };
+      const { windowId, created } = await resolveOrCreateWindowForWorkspace(ws.id, ws.name);
+      return { ok: true, windowId, created, workspaceId: ws.id, workspaceName: ws.name };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+
   // Shared by moveSelectedTabsToWorkspace (external hotkey, "whatever's
   // selected") and moveTabForRuleDialog (the add-rule dialog's "move this
   // tab now" checkbox, one specific tab) -- both need exactly "recreate
@@ -1103,8 +1203,10 @@
     });
   }
 
-  // ---------- relay link (external hotkey -> jumpToLastRoutedTab; also used
-  // in the other direction for requestActivateWorkspace above) ----------
+  // ---------- relay link (external hotkey -> jumpToLastRoutedTab /
+  // moveSelectedTabsToWorkspace / jumpToLastMovedTabs / openAddRuleDialog /
+  // jumpToWorkspace; also used in the other direction for
+  // requestActivateWorkspace above) ----------
   function connectRelay() {
     let socket;
     try {
@@ -1144,6 +1246,11 @@
       }
       if (msg.type === "openAddRuleDialog") {
         const result = await openAddRuleDialogForFocusedWindow();
+        socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
+        return;
+      }
+      if (msg.type === "jumpToWorkspace") {
+        const result = await jumpToWorkspace(msg.workspaceName);
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }
@@ -1190,6 +1297,11 @@
     registerContextMenu();
 
     chrome.tabs.onCreated.addListener((tab) => {
+      // Independent of everything below -- runs for every new tab
+      // regardless of the recreated-tab marker (that marker exists to avoid
+      // *background-routing* misdetection specifically, not relevant here).
+      redirectNewTabIfConfigured(tab);
+
       // Our own recreateTabInWindow (jumpToTab, moveTabsToWorkspace) landing
       // a tab it created itself -- not a real external/background route. See
       // windowsReceivingOwnRecreatedTabs's own comment for the bug this
@@ -1323,6 +1435,8 @@
       linkRoutesController,
       addWorkspaceRule,
       openAddRuleDialogForFocusedWindow,
+      jumpToWorkspace,
+      NEW_TAB_OVERRIDES,
     };
     console.log(TAG, "Ready");
   }

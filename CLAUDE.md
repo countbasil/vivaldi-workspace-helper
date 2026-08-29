@@ -920,6 +920,179 @@ focused by the time each step ran, and it may have moved an already-open
 real tab into an unexpected workspace window as a result -- flagged to
 Aaron rather than guessed at or auto-"fixed.")
 
+## Fifth feature: jump-to-workspace via the relay, retiring the CDP dependency (2026-08-29)
+
+The original per-workspace jump (the very first thing this project built —
+see "Goal and architecture" above and `bridge/workspace-jump.js`) has always
+needed Vivaldi running with `--remote-debugging-port`, via the
+`Vivaldi Debug.app` wrapper — the one launch-path requirement every other
+feature in this file deliberately avoided once the relay/injected-script
+architecture existed (see the Second feature section's header comment: "no
+dependency on chrome-remote-interface/CDP... at all"). That gap was called
+out as a known follow-up back when the relay was first built (Second
+feature section, "if the relay proves reliable, migrating the *original*
+per-workspace jump onto it too... is a natural follow-up, not yet done") and
+sat unaddressed for two weeks until a KM macro failure (`open -a
+"Vivaldi.app"` instead of the Debug wrapper → `NOT_DEBUG_MODE`) surfaced the
+question of whether debug mode could be avoided entirely.
+
+**Not a new mechanism — the relay already had every piece needed.**
+`resolveOrCreateWindowForWorkspace` (`injected/workspace-route-watcher.js`,
+added for the Third feature) already implements
+`bridge/workspace-jump.js`'s exact two-branch decision (existing window →
+focus it; no window → create a blank one and assign it via
+`activateWorkspaceViaMenu`'s same AppleScript menu click, run by
+`relay/server.js` since only a real OS process can drive System Events).
+The only thing missing was a standalone entry point that skips the
+tab-carrying logic `jumpToTab`/`moveTabsToWorkspace` build on top of it.
+Added:
+
+- `jumpToWorkspace(workspaceName)` (`workspace-route-watcher.js`) — looks
+  the workspace up by name and calls
+  `resolveOrCreateWindowForWorkspace(ws.id, ws.name)` directly, nothing
+  else. Deliberately does *not* clean up a freshly-created window's leftover
+  default blank tab the way `jumpToTab`/`moveTabsToWorkspace` do (via
+  `closeDefaultTabIfSafe`) — there's no real tab landing in the window here,
+  so that blank tab isn't a leftover to clean up, it's the correct end
+  state: exactly what `bridge/workspace-jump.js`'s own `ASSIGNED` branch
+  already produces (`chrome.windows.create({})`, then just assigning the
+  workspace, nothing loaded into it).
+- `GET /jump-to-workspace?workspace=<name>` (`relay/server.js`) —
+  same `sendBrowserRequest`/`{type:"jumpToWorkspace", workspaceName}`
+  plumbing as every other relay endpoint. `400` +
+  `{reason:"MISSING_WORKSPACE_PARAM"}` if the query param is absent
+  (mirrors `/move-selected-tabs-to-workspace`'s own validation);
+  `{reason:"UNKNOWN_WORKSPACE"}` from the page side otherwise.
+- `window.__vwh.jumpToWorkspace(name)` — exposed for console testing, same
+  as the rest of this file's debugging surface.
+
+**Deliberately left `bridge/workspace-jump.js`, `wrapper-app/`, and
+existing CDP-based Keyboard Maestro macros untouched**, same call as when
+the relay was first introduced — nothing here forces anyone off the CDP
+path, it's just no longer the only option. README's Feature 3 section now
+documents the relay-based path as the recommended default and the CDP path
+as the original/legacy method, kept working for whoever already has it set
+up.
+
+**Confirmed live, same session (2026-08-29)**, via `injected/install.sh` +
+a full Vivaldi restart (through `Vivaldi Debug.app`, per Aaron's standing
+"notify before touching the screen" preference — warned, waited ~10s, then
+proceeded per the established restart-for-testing workflow) + real
+`curl -G --data-urlencode "workspace=Claude"` calls against the running
+relay, not synthetic messages:
+- First call against a workspace with no window yet →
+  `{"ok":true,"created":true,"windowId":…}` — new blank window created and
+  assigned.
+- Second call, same workspace, now windowed → `{"ok":true,"created":false}`
+  with the *same* `windowId` — existing window found and focused, no
+  duplicate window.
+- Missing `workspace` param → `400 {"ok":false,"reason":"MISSING_WORKSPACE_PARAM"}`.
+- Unrecognized workspace name → `{"ok":false,"reason":"UNKNOWN_WORKSPACE"}`.
+
+All four match the documented contract exactly on the first try — expected,
+since this reuses `resolveOrCreateWindowForWorkspace` unchanged rather than
+introducing new mechanism, but confirmed rather than assumed per this
+project's own standard.
+
+## Sixth feature: per-workspace new-tab-page override (2026-08-29)
+
+Vivaldi only has one global "New Tab Page" setting (Settings → Tabs); there's
+no per-workspace equivalent. Aaron wanted Cmd+T in his "Claude" workspace to
+open claude.ai directly rather than the global Speed Dial/blank page, for
+one or two workspaces only — not a general setting.
+
+**Detection signal.** A brand-new blank tab is detected via its URL being
+one of Chromium/Vivaldi's own placeholder values, checked on both
+`pendingUrl` (set the instant the tab exists, before it's started loading)
+and `url` (once it's settled) to cover the listener firing at either point.
+
+**Implementation** (`injected/workspace-route-watcher.js`):
+- `NEW_TAB_OVERRIDES` — a plain `{workspaceName: url}` constant near the top
+  of the file, alongside the other hand-edited constants (`RELAY_PORT`
+  etc.). Keyed by name, matching every other hand-configured spot in this
+  codebase (`findWorkspaceByName`). Deliberately not a UI/dialog or
+  `chrome.storage`-backed setting — Aaron only wants this for one or two
+  workspaces, and this codebase's existing edit-and-reinstall workflow
+  (`injected/install.sh` + restart) already covers changing it.
+- `redirectNewTabIfConfigured(tab)` — checks `pendingUrl`/`url` against
+  `BLANK_NEW_TAB_URLS`, excludes anything with an `openerTabId` (see the bug
+  writeup below), looks up the *window's* currently displayed workspace via
+  the existing `findWorkspaceIdForWindow` (not the new tab's own
+  `vivExtData`, which wouldn't be populated by a genuine Cmd+T's own
+  detection path in time to matter here — this needs "what workspace was I
+  looking at", not the tab's own membership), and calls
+  `chrome.tabs.update(tab.id, {url: overrideUrl})` if that workspace has an
+  entry. Called unconditionally at the top of the existing
+  `chrome.tabs.onCreated` listener in `init()` — independent of
+  `windowsReceivingOwnRecreatedTabs`, since that marker only guards against
+  *background-routing* misdetection and this is an unrelated concern.
+
+**Bug: shipped, reported broken by Aaron on first real use, root-caused and
+fixed same session.** The first version's `BLANK_NEW_TAB_URLS` matched only
+`chrome://newtab/`, "confirmed live" by testing `chrome.tabs.create({})`
+issued via CDP — reasoning at the time that this was "the same underlying
+call Cmd+T itself makes." That assumption was wrong, and this project has
+been burned by the same class of mistake before (native UI actions
+behaving differently from their programmatic equivalents — see the
+context-menu `tab` argument and the Escape/Enter/arrow-key findings
+elsewhere in this file). Aaron tried a real Cmd+T immediately after the
+first "confirmed live" report and it did nothing.
+
+Root-caused by actually reproducing with a real keystroke rather than
+reasoning about it further: a diagnostic `chrome.tabs.onCreated`/`onUpdated`
+listener installed via CDP, then a genuine `System Events` Cmd+T sent to the
+focused Claude window (per the standing "notify before touching the screen"
+rule), captured the real tab as `pendingUrl:"about:blank"`, settling
+permanently at `url:"about:blank", status:"complete"` — a completely
+different signature from the synthetic test. Vivaldi renders its Speed Dial
+as an in-page overlay on top of `about:blank` for a real new tab, and never
+navigates the tab's actual `url` away from it at all; the extension API's
+own default-tab behavior (`chrome.tabs.create({})`/`chrome.windows.create({})`)
+takes an entirely different internal path that does navigate to
+`chrome://newtab/`. Fixed by matching both:
+`BLANK_NEW_TAB_URLS = new Set(["chrome://newtab/", "about:blank"])`.
+
+Widening the match to `about:blank` introduced a new, real risk that wasn't
+present with the more Chromium-specific `chrome://newtab/` alone: a page's
+own `window.open()` call (no URL yet, navigated moments later by that
+page's own JS — an OAuth popup, for instance) also starts life as
+`about:blank`, and this redirect would otherwise race that and hijack it.
+Caught during the fix, not by a live repro of that specific scenario — the
+mitigation instead relies on standard, documented Chromium extension-API
+semantics rather than empirical reverse-engineering (unlike almost
+everything else in this file): `chrome.tabs.Tab.openerTabId` is set
+whenever a tab was opened by another tab's script, and absent for a genuine
+Cmd+T/New Tab click. `redirectNewTabIfConfigured` now excludes any tab with
+an `openerTabId`.
+
+**Confirmed live, same session, with a real keystroke this time** (not just
+CDP-synthesized tab creation): reinstalled, restarted Vivaldi, focused the
+real Claude workspace window, and sent an actual `System Events` Cmd+T —
+the resulting tab settled on `https://claude.ai/new` with the real page
+title and favicon loaded, confirming the fix works for the trigger that
+actually matters. The original CDP-based positive/negative tests (Claude →
+redirected, Work → untouched at `chrome://newtab/`) still stand for the
+synthetic-tab-creation path — both signatures are now handled.
+
+**Known limitation, confirmed live, not yet solved**: a *brand-new* window's
+own default tab — the one `resolveOrCreateWindowForWorkspace` creates via
+`chrome.windows.create({})` when no window exists yet for a workspace (used
+by `jumpToWorkspace`, `jumpToTab`, and `moveTabsToWorkspace`) — does **not**
+get the override. Confirmed live: triggering `jumpToWorkspace("Claude")`
+against a windowless Claude workspace left that window's own default tab on
+`chrome://vivaldi-webui/startpage`, not claude.ai. Root cause: at the moment
+that default tab's own `onCreated` fires, the new window has no workspace
+assigned yet (the AppleScript assignment happens afterward) — so
+`findWorkspaceIdForWindow` correctly (if unhelpfully) returns `null` at
+exactly the moment `redirectNewTabIfConfigured` needs an answer. Not fixed
+in this session — the natural fix would be re-checking that specific
+leftover default tab after `resolveOrCreateWindowForWorkspace`'s own
+workspace-assignment settle delay, the same place `closeDefaultTabIfSafe` is
+already called from those other three functions, but `jumpToWorkspace`
+deliberately *doesn't* call `closeDefaultTabIfSafe` (see the Fifth feature
+section — the blank tab is the intended end state there). Left as a known
+gap rather than guessed at; flag to Aaron if he wants it closed.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
@@ -933,5 +1106,7 @@ Aaron rather than guessed at or auto-"fixed.")
   (Fourth feature's rules API — `.getRules()` lives on a sibling module, not
   this one, but `.addLinkRoutingRule(type, expression, workspaceId)`/
   `.removeLinkRoutingRules(ids)` are here), `__vwh.addWorkspaceRule(...)`,
-  `__vwh.openAddRuleDialogForFocusedWindow()`.
+  `__vwh.openAddRuleDialogForFocusedWindow()`, `__vwh.jumpToWorkspace(name)`
+  (Fifth feature), `__vwh.NEW_TAB_OVERRIDES` (Sixth feature — read-only here;
+  edit the constant in the source file and reinstall to change it).
 - Relay logs: `~/Library/Logs/vivaldi-workspace-relay.log`.

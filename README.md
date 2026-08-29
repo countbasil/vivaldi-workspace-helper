@@ -192,25 +192,72 @@ the History menu.
   `__vwh.linkRoutesController` (Feature 5's rules API, `.getRules()`/
   `.addLinkRoutingRule(type, expression, workspaceId)`/
   `.removeLinkRoutingRules(ids)`), `__vwh.addWorkspaceRule(...)`,
-  `__vwh.openAddRuleDialogForFocusedWindow()`.
+  `__vwh.openAddRuleDialogForFocusedWindow()`, `__vwh.jumpToWorkspace(name)`
+  (Feature 3's relay-based path).
 - Relay connection state/errors: `~/Library/Logs/vivaldi-workspace-relay.log`.
 
 ---
 
-## Feature 3: jump-to-workspace hotkeys, triggered from outside Vivaldi (CDP-based)
+## Feature 3: jump-to-workspace hotkeys, triggered from outside Vivaldi
 
 Unlike Features 1 & 2, this isn't reacting to a routed tab — it's a hotkey
 you trigger yourself, for a specific workspace you name in advance, from
-anywhere. Example: bind a global hotkey to `workspace-jump.js "Claude"` so
-you always land in your Claude workspace's window (creating and assigning it
-if it doesn't currently have one) with a single keypress, whether or not it
+anywhere. Example: bind a global hotkey to jump to "Claude" so you always
+land in your Claude workspace's window (creating and assigning it if it
+doesn't currently have one) with a single keypress, whether or not it
 happened to already be open.
+
+There are two ways to do this — pick one:
+
+- **Relay-based (recommended)** — same mechanism as Features 2, 4 & 5: no
+  CDP, no debug port, no special launcher app. Needs the same install as
+  those (`injected/install.sh` + the relay running).
+- **CDP-based (original method)** — the first version of this feature,
+  predating the relay/injected-script approach entirely. Needs Vivaldi
+  always running with `--remote-debugging-port`, via the special
+  `Vivaldi Debug.app` launcher. Kept working for anyone already relying on
+  it; not the recommended path for a fresh install.
+
+### Relay-based (recommended)
+
+Hits a new relay endpoint:
+
+```
+GET http://127.0.0.1:8877/jump-to-workspace?workspace=<name>
+```
+
+— focuses the window currently showing the named workspace, or creates a
+new blank window and assigns it there if none exists yet, exactly mirroring
+what the CDP script below does. Response: `{"ok":true, "windowId":…,
+"created":…, "workspaceId":…, "workspaceName":…}`, or `{"ok":false,
+"reason":…}` — `"MISSING_WORKSPACE_PARAM"` (400, query param absent),
+`"UNKNOWN_WORKSPACE"` (name didn't match any configured workspace), plus the
+usual `"NOT_CONNECTED"`/`"TIMEOUT"`.
+
+Wire up a Keyboard Maestro macro per workspace (or any hotkey tool), each
+bound to a hotkey and running:
+
+```
+curl -s -G --data-urlencode "workspace=Claude" \
+  http://127.0.0.1:8877/jump-to-workspace
+```
+
+— replace `Claude` with the actual name of the workspace that macro targets
+(no placeholder brackets — `--data-urlencode` handles names containing
+spaces correctly, so don't paste the name straight into the URL). Same
+mirrored pattern as Feature 4's per-workspace move macros.
+
+First use that needs to *create* a window will prompt for an
+Accessibility/Automation permission, same as Feature 4 — the relay drives
+Vivaldi's Window menu via System Events. Allow it once.
+
+### CDP-based (original method)
 
 This works over the Chrome DevTools Protocol rather than injected page JS,
 so it needs Vivaldi running with `--remote-debugging-port` enabled at all
 times.
 
-### 1. Build and install the debug launcher
+#### 1. Build and install the debug launcher
 
 ```
 cd wrapper-app
@@ -224,14 +271,14 @@ directly, so it's never accidentally started without
 `--remote-debugging-port` (which would break the bridge script below until
 you quit and relaunch it correctly).
 
-### 2. Install the bridge script's dependencies
+#### 2. Install the bridge script's dependencies
 
 ```
 cd bridge
 npm install
 ```
 
-### 3. Wire up a Keyboard Maestro macro per workspace
+#### 3. Wire up a Keyboard Maestro macro per workspace
 
 One macro per workspace, each running:
 
@@ -459,15 +506,63 @@ triggers that. Neither needs any configuration or should be noticeable.
 
 ---
 
+## Feature 6: per-workspace new-tab-page override
+
+Vivaldi only has one global "New Tab Page" setting (Settings → Tabs → New
+Tab Page) — no way to give an individual workspace its own. This lets one or
+two specific workspaces override it: e.g. Cmd+T inside the "Claude"
+workspace opens `claude.ai` directly instead of the global Speed
+Dial/blank page/whatever else is configured. Everywhere else, Vivaldi's own
+setting is untouched.
+
+Needs the same install as Features 1, 2, 4 & 5 (`injected/install.sh` +
+Vivaldi restart) — nothing extra to install, but **this one is configured
+by editing the source file directly**, not through any in-browser UI:
+
+```js
+// injected/workspace-route-watcher.js
+const NEW_TAB_OVERRIDES = {
+  Claude: "https://claude.ai",
+};
+```
+
+Add one entry per workspace name (must match the real workspace name
+exactly) → URL you want Cmd+T to open there, then re-run
+`injected/install.sh` and restart Vivaldi. There's deliberately no dialog or
+settings UI for this, unlike the other features — it's meant for the couple
+of workspaces you'd actually want it for, not general configuration.
+
+**How it works.** A brand-new tab reports one of two placeholder URLs the
+instant it's created, depending on how it was opened — a real Cmd+T settles
+permanently on `about:blank` (confirmed with an actual keystroke, not just
+simulated), while a programmatically-created blank tab uses Chromium's
+`chrome://newtab/` instead. A listener on tab creation matches either one
+and redirects immediately if the window it landed in is currently
+displaying a workspace with an entry above — but skips any tab that has an
+`openerTabId` set (i.e. opened by a page's own JavaScript, like an OAuth
+popup), so a legitimate blank popup a site opens for itself is never
+hijacked.
+
+**Known gap.** A workspace's *brand-new* window — the one created the first
+time you jump to a workspace that doesn't have one yet (Features 3/4/5) —
+leaves its own default blank tab on Vivaldi's regular New Tab Page, not the
+override. Confirmed live: at the moment that particular tab is created, the
+window doesn't have a workspace assigned yet, so there's nothing yet to
+match against. Only affects that one leftover tab in a freshly-created
+window; every subsequent Cmd+T in that same window works normally.
+
+---
+
 ## Uninstalling
 
-- Features 1, 2, 4 & 5: delete the `<script>` tags injected into
-  `main.html`/`window.html` (re-running `install.sh` after removing the
-  source files will fail — easiest is to reinstall/repair Vivaldi, or
-  manually edit those two HTML files; this also removes Feature 5's context
-  menu item, since it's registered by the same script), `launchctl unload` +
-  remove the LaunchAgent plist, remove the extension via
-  `vivaldi://extensions` if installed, remove any Feature 4 Keyboard Maestro
-  macros.
-- Feature 3: remove the Keyboard Maestro macros, delete
+- Features 1, 2, 4, 5 & 6, and Feature 3's relay-based path: delete the
+  `<script>` tags injected into `main.html`/`window.html` (re-running
+  `install.sh` after removing the source files will fail — easiest is to
+  reinstall/repair Vivaldi, or manually edit those two HTML files; this also
+  removes Feature 5's context menu item, since it's registered by the same
+  script), `launchctl unload` + remove the LaunchAgent plist, remove the
+  extension via `vivaldi://extensions` if installed, remove any Feature 3/4
+  Keyboard Maestro macros.
+- Feature 3's CDP-based path (if you set it up instead of, or alongside, the
+  relay-based one): remove those Keyboard Maestro macros, delete
   `/Applications/Vivaldi Debug.app`, go back to launching Vivaldi normally.
