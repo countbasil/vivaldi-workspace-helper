@@ -175,7 +175,7 @@
       if (message.moved) text += message.switched ? "\nTab moved" : "\n\nTab moved — click to switch";
       el.textContent = text;
     } else {
-      el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick to switch`;
+      el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick or press Tab to switch`;
     }
 
     if (interactive) {
@@ -187,17 +187,22 @@
     document.body.appendChild(el);
     toastEl = el;
 
-    // Keyboard shortcut for this toast -- scoped to "moved-tabs" only, not
-    // every interactive variant. "route" fires for genuinely background
-    // routes (cmd+click, or an external open landing in a windowless
-    // workspace) that can happen while Aaron is doing something completely
-    // unrelated in another tab -- stealing keyboard focus there would be
-    // exactly the kind of surprise this project exists to avoid (see
-    // CLAUDE.md's "notify before touching the screen" spirit, applied here
-    // to an unsolicited focus steal instead of an explicit action). A
-    // "moved-tabs" toast, by contrast, only ever appears as the direct
-    // result of Aaron's own explicit move-to-workspace hotkey, so focus is
-    // already in a deliberate, expected place.
+    // Keyboard shortcut for this toast -- originally scoped to "moved-tabs"
+    // only (2026-08-26), not every interactive variant, because "route"
+    // fires for genuinely background routes (cmd+click, or an external open
+    // landing in a windowless workspace) that can happen while Aaron is
+    // doing something completely unrelated in another tab -- stealing
+    // keyboard focus there was judged exactly the kind of surprise this
+    // project exists to avoid (see CLAUDE.md's "notify before touching the
+    // screen" spirit, applied here to an unsolicited focus steal instead of
+    // an explicit action).
+    //
+    // Extended to "route" too (2026-09-01), per Aaron's explicit request:
+    // he wants "press Tab to switch" to mean the same thing in both toasts,
+    // so a background-routed tab (cmd+click) is reachable by Tab exactly
+    // like a hotkey-moved one. This deliberately accepts the tradeoff noted
+    // above -- an occasional focus steal into an unrelated window -- as the
+    // cost of the wording being true rather than aspirational.
     //
     // The mechanism reuses the add-rule dialog's own discovery (2026-08-25,
     // see showAddRuleDialog below): giving an element tabIndex=-1 and
@@ -217,7 +222,7 @@
     // memory for that correction). Removed anyway per Aaron's request: Tab
     // alone already covers the need, and a fixed global combo risks
     // colliding with shortcuts other people already have bound to ⌥⌘J.
-    if (variant === "moved-tabs") {
+    if (variant === "moved-tabs" || variant === "route") {
       el.tabIndex = -1;
       el.focus();
       toastKeydownHandler = (e) => {

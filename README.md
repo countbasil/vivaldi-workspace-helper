@@ -17,11 +17,12 @@ but separate per-workspace convenience:
   toast, no click — it just happens.
 - **Feature 2 — toast + jump for routed tabs opened from inside Vivaldi.**
   Cmd+clicking a link (or opening a new tab and entering a URL) that gets
-  routed to a workspace shows a toast naming where it went. Click the toast
-  to jump there — creating and assigning a window first if one doesn't
-  exist yet, so the tabs already in the foreground window aren't disturbed.
-  You can also trigger that same jump *without* clicking, via an external
-  hotkey utility (see below for why that has to be external rather than a
+  routed to a workspace shows a toast naming where it went. Click the toast,
+  or press Tab while it's showing, to jump there — creating and assigning a
+  window first if one doesn't exist yet, so the tabs already in the
+  foreground window aren't disturbed. You can also trigger that same jump
+  *without* the toast being on screen at all, via an external hotkey
+  utility (see below for why that has to be external rather than a
   keybinding inside Vivaldi's own page JS).
 - **Feature 3 — jump-to-workspace hotkeys, triggered from outside Vivaldi.**
   A hotkey (via Keyboard Maestro or similar) that activates Vivaldi and
@@ -49,11 +50,9 @@ but separate per-workspace convenience:
   New Tab Page setting.
 
 Features 1 and 2 are two branches of the same underlying detection code and
-share one install step. Features 4, 5 & 6 reuse that same install (just
-different relay endpoints, or in Feature 6's case a source-edited constant)
-— see each one's own section below for setup. Feature 3 has two paths: a
-relay-based one (recommended) that reuses that same install, and an older,
-separate CDP-based mechanism with its own install step. All of these can be
+share one install step. Features 3, 4, 5 & 6 all reuse that same install
+(just different relay endpoints, or in Feature 6's case a source-edited
+constant) — see each one's own section below for setup. All of these can be
 installed independently of each other.
 
 For the full design rationale (including a rejected first approach and every
@@ -145,9 +144,9 @@ setup:
   first if that workspace doesn't have one yet.
 - **Feature 2**: a tab backgrounded by the user themself from inside
   Vivaldi (cmd+click, or opening a new tab and typing a URL) instead shows a
-  toast naming the destination; click it to jump — again creating and
-  assigning a window first if needed, so nothing already in the current
-  window gets disturbed.
+  toast naming the destination; click it, or press Tab while it's showing,
+  to jump — again creating and assigning a window first if needed, so
+  nothing already in the current window gets disturbed.
 
 ### 4. (Optional) External hotkey for Feature 2's jump, without clicking the toast
 
@@ -218,32 +217,20 @@ land in your Claude workspace's window (creating and assigning it if it
 doesn't currently have one) with a single keypress, whether or not it
 happened to already be open.
 
-There are two ways to do this — pick one:
-
-- **Relay-based (recommended)** — same mechanism as Features 2, 4 & 5: no
-  CDP, no debug port, no special launcher app. Needs the same install as
-  those (`injected/install.sh` + the relay running).
-- **CDP-based (original method)** — the first version of this feature,
-  predating the relay/injected-script approach entirely. Needs Vivaldi
-  always running with `--remote-debugging-port`, via the special
-  `Vivaldi Debug.app` launcher. Kept working for anyone already relying on
-  it; not the recommended path for a fresh install.
-
-### Relay-based (recommended)
-
-Hits a new relay endpoint:
+Needs the same install as Features 1 & 2 (`injected/install.sh` + the
+relay running) — nothing extra to install, just a new relay endpoint:
 
 ```
 GET http://127.0.0.1:8877/jump-to-workspace?workspace=<name>
 ```
 
 — focuses the window currently showing the named workspace, or creates a
-new blank window and assigns it there if none exists yet, exactly mirroring
-what the CDP script below does. Response: `{"ok":true, "windowId":…,
-"created":…, "workspaceId":…, "workspaceName":…}`, or `{"ok":false,
-"reason":…}` — `"MISSING_WORKSPACE_PARAM"` (400, query param absent),
-`"UNKNOWN_WORKSPACE"` (name didn't match any configured workspace), plus the
-usual `"NOT_CONNECTED"`/`"TIMEOUT"`.
+new blank window and assigns it there if none exists yet. Response:
+`{"ok":true, "windowId":…, "created":…, "workspaceId":…,
+"workspaceName":…}`, or `{"ok":false, "reason":…}` —
+`"MISSING_WORKSPACE_PARAM"` (400, query param absent), `"UNKNOWN_WORKSPACE"`
+(name didn't match any configured workspace), plus the usual
+`"NOT_CONNECTED"`/`"TIMEOUT"`.
 
 Wire up a Keyboard Maestro macro per workspace (or any hotkey tool), each
 bound to a hotkey and running:
@@ -261,53 +248,6 @@ mirrored pattern as Feature 4's per-workspace move macros.
 First use that needs to *create* a window will prompt for an
 Accessibility/Automation permission, same as Feature 4 — the relay drives
 Vivaldi's Window menu via System Events. Allow it once.
-
-### CDP-based (original method)
-
-This works over the Chrome DevTools Protocol rather than injected page JS,
-so it needs Vivaldi running with `--remote-debugging-port` enabled at all
-times.
-
-#### 1. Build and install the debug launcher
-
-```
-cd wrapper-app
-osacompile -o "Vivaldi Debug.app" VivaldiDebugLauncher.applescript
-mv "Vivaldi Debug.app" /Applications/
-```
-
-From now on, **always launch Vivaldi via `Vivaldi Debug.app`** — Dock icon,
-Login Items, default-browser handler, all of it — instead of Vivaldi.app
-directly, so it's never accidentally started without
-`--remote-debugging-port` (which would break the bridge script below until
-you quit and relaunch it correctly).
-
-#### 2. Install the bridge script's dependencies
-
-```
-cd bridge
-npm install
-```
-
-#### 3. Wire up a Keyboard Maestro macro per workspace
-
-One macro per workspace, each running:
-
-```
-node /path/to/vivaldi-workspace-helper/bridge/workspace-jump.js "Claude"
-```
-
-— replace `Claude` with the actual name of the workspace that macro targets
-(don't leave in any placeholder brackets/angle brackets; the exact string
-here is what gets matched against your real workspace names). Bound to
-whatever hotkey you want for that workspace. First run may prompt
-for Accessibility/Automation permission for Keyboard Maestro Engine to
-control Vivaldi via System Events — allow it once.
-
-The script prints `FOCUSED`, `ASSIGNED`, `NOT_DEBUG_MODE` (Vivaldi isn't
-running with the debug port — relaunch via `Vivaldi Debug.app`), or
-`ERROR:<message>`; wire Keyboard Maestro's action up to react to that if you
-want feedback beyond the window switch itself.
 
 ---
 
@@ -338,8 +278,8 @@ none exists yet, exactly like Features 1–3 already do, so nothing already
 in that window gets disturbed. Focus deliberately stays on the window you
 triggered the move from — the moved tab(s) aren't followed there
 automatically. Instead, a "Moved N tab(s) to `<emoji>` `<name>`" toast
-appears with a click-to-switch action, and the same jump is reachable from
-outside Vivaldi too:
+appears — click it, or press Tab while it's showing, to switch there — and
+the same jump is reachable from outside Vivaldi too:
 
 ```
 GET http://127.0.0.1:8877/jump-last-moved-tabs
@@ -351,10 +291,10 @@ per-workspace move macros below if you want a keyboard-only way to follow
 a move without reaching for the mouse.
 
 **First use will prompt for an Accessibility/Automation permission** — the
-relay drives Vivaldi's Window menu via System Events (same as Feature 3's
-bridge script) whenever it needs to create and assign a new workspace
-window, so macOS asks you to approve Node controlling System Events/Vivaldi
-the first time that actually happens. Allow it once; it won't ask again.
+relay drives Vivaldi's Window menu via System Events (same as Feature 3)
+whenever it needs to create and assign a new workspace window, so macOS
+asks you to approve Node controlling System Events/Vivaldi the first time
+that actually happens. Allow it once; it won't ask again.
 
 ### Wire up a Keyboard Maestro macro per workspace
 
@@ -371,7 +311,7 @@ curl -s -G --data-urlencode "workspace=Claude" \
 literally against what's configured in Vivaldi). `--data-urlencode` handles
 workspace names containing spaces correctly — don't just paste the name
 straight into the URL. Same mirrored pattern as Feature 3's per-workspace
-macros, just hitting the relay instead of running the CDP bridge script.
+macros.
 
 Response is JSON: `{"ok":true, "windowId":…, "sourceWindowId":…, "tabCount":…,
 "workspaceId":…, "workspaceName":…, "created":…}` on success (`windowId` is
@@ -566,14 +506,10 @@ window; every subsequent Cmd+T in that same window works normally.
 
 ## Uninstalling
 
-- Features 1, 2, 4, 5 & 6, and Feature 3's relay-based path: delete the
-  `<script>` tags injected into `main.html`/`window.html` (re-running
-  `install.sh` after removing the source files will fail — easiest is to
-  reinstall/repair Vivaldi, or manually edit those two HTML files; this also
-  removes Feature 5's context menu item, since it's registered by the same
-  script), `launchctl unload` + remove the LaunchAgent plist, remove the
-  extension via `vivaldi://extensions` if installed, remove any Feature 3/4
-  Keyboard Maestro macros.
-- Feature 3's CDP-based path (if you set it up instead of, or alongside, the
-  relay-based one): remove those Keyboard Maestro macros, delete
-  `/Applications/Vivaldi Debug.app`, go back to launching Vivaldi normally.
+Delete the `<script>` tags injected into `main.html`/`window.html`
+(re-running `install.sh` after removing the source files will fail —
+easiest is to reinstall/repair Vivaldi, or manually edit those two HTML
+files; this also removes Feature 5's context menu item, since it's
+registered by the same script), `launchctl unload` + remove the LaunchAgent
+plist, remove the extension via `vivaldi://extensions` if installed, and
+remove any Feature 3/4 Keyboard Maestro macros.

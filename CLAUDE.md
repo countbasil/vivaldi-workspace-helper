@@ -18,26 +18,32 @@ exists yet, without ever silently reassigning an unrelated existing window
 planning doc's "Rejected approach" section for why this isn't just a
 Keyboard Maestro macro sending `Control-N`).
 
-The real design queries Vivaldi's internal workspace store live over the
-Chrome DevTools Protocol to know, before acting, whether the target
-workspace is already open in some window — then either focuses that window
-directly or creates a fresh blank one and assigns it via the safe built-in
-shortcut. Requires Vivaldi to always run with `--remote-debugging-port`
-enabled.
+The design queries Vivaldi's internal workspace store live (via the same
+webpack-module-scanning technique used throughout `injected/`) to know,
+before acting, whether the target workspace is already open in some window —
+then either focuses that window directly or creates a fresh blank one and
+assigns it via the safe built-in shortcut. This is reachable via an external
+hotkey through `relay/server.js`'s `/jump-to-workspace` endpoint — see the
+Fifth feature section below for the mechanism.
 
-- `bridge/workspace-jump.js` — Node/CDP bridge; the actual decision logic.
-  Run `npm install` in `bridge/` once before first use.
-- `wrapper-app/VivaldiDebugLauncher.applescript` — source for the compiled
-  `/Applications/Vivaldi Debug.app`, which is how Vivaldi must always be
-  launched (Dock/Login Items) so the debug flag is never missing.
-- Keyboard Maestro (external) — one macro per workspace, calling the bridge
-  script and sending a keystroke if it signals `SEND_DIGIT:<n>`.
-
-If you're picking this project back up, read the planning doc's "Decided
-approach" section before changing the bridge script or wrapper app — the
-constraints there (no workspace-assignment API, module IDs unstable across
-builds, the AppleScript-applet default-browser limitation) came from
-extensive empirical testing, not assumptions.
+**Historical note**: the original version of this feature (predating the
+relay/injected-script architecture entirely) queried the workspace store
+over the Chrome DevTools Protocol instead, via a `bridge/workspace-jump.js`
+Node script and a `wrapper-app/VivaldiDebugLauncher.applescript`-compiled
+`Vivaldi Debug.app` (required so Vivaldi always ran with
+`--remote-debugging-port`). Once the Fifth feature made the relay capable of
+the same two-branch decision without needing the debug port at all, that CDP
+path became pure legacy surface — kept for a couple of weeks as a documented
+"kept working, not recommended" option, then removed outright (2026-09-01,
+once Aaron confirmed his own macros had already moved to the relay
+endpoint). If you find old references to `bridge/`/`wrapper-app/` elsewhere
+in this file's history, that's why — see the planning doc for the full
+timeline. Read the planning doc's "Decided approach" section before
+reintroducing anything CDP-based — the constraints there (no
+workspace-assignment API, module IDs unstable across builds, the
+AppleScript-applet default-browser limitation) came from extensive empirical
+testing, not assumptions, and mostly still apply to the relay-based
+mechanism that replaced it.
 
 ## Second feature: toast + jump for auto-routed background tabs
 
@@ -333,11 +339,13 @@ Vivaldi update, same caveat as the theme-switcher, and Vivaldi must be fully
 restarted after installing/updating either one — `main.html` and every open
 window's `window.html` are only read at their own startup.
 
-This intentionally leaves `bridge/`, `wrapper-app/`, and the existing
-per-workspace Keyboard Maestro macros untouched. If the relay proves
-reliable, migrating the *original* per-workspace jump onto it too (retiring
-CDP/the wrapper app/the debug port entirely) is a natural follow-up, not yet
-done — see the planning doc.
+This intentionally left `bridge/`, `wrapper-app/`, and the existing
+per-workspace Keyboard Maestro macros untouched at the time. Migrating the
+*original* per-workspace jump onto the relay too (retiring CDP/the wrapper
+app/the debug port entirely) was flagged here as a natural follow-up — it
+happened in the Fifth feature below, and `bridge/`/`wrapper-app/` were
+subsequently deleted once that path was confirmed no longer needed (see
+that section's historical note).
 
 ## Third feature: move the current tab(s) to a workspace (2026-08-13, works around a Vivaldi bug)
 
@@ -967,12 +975,20 @@ Added:
   as the rest of this file's debugging surface.
 
 **Deliberately left `bridge/workspace-jump.js`, `wrapper-app/`, and
-existing CDP-based Keyboard Maestro macros untouched**, same call as when
-the relay was first introduced — nothing here forces anyone off the CDP
-path, it's just no longer the only option. README's Feature 3 section now
-documents the relay-based path as the recommended default and the CDP path
-as the original/legacy method, kept working for whoever already has it set
-up.
+existing CDP-based Keyboard Maestro macros untouched at first**, same call
+as when the relay was first introduced — nothing forced anyone off the CDP
+path right away, it was just no longer the only option. README's Feature 3
+section documented the relay-based path as the recommended default and the
+CDP path as the original/legacy method for a couple of weeks.
+
+**Removed outright (2026-09-01)**, once Aaron confirmed his own
+Keyboard Maestro macros had already been repointed at the relay's
+`/jump-to-workspace` endpoint and nothing still depended on the CDP path:
+`bridge/` and `wrapper-app/` were deleted from the repo, and the README's
+CDP-based subsection of Feature 3 (along with the CDP-specific bullet in
+"Uninstalling") was removed. `Vivaldi Debug.app` itself (in
+`/Applications/`) was left alone — deleting an app bundle outside the repo
+wasn't part of what was asked, and it's harmless sitting unused.
 
 **Confirmed live, same session (2026-08-29)**, via `injected/install.sh` +
 a full Vivaldi restart (through `Vivaldi Debug.app`, per Aaron's standing
