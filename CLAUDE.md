@@ -1109,6 +1109,94 @@ deliberately *doesn't* call `closeDefaultTabIfSafe` (see the Fifth feature
 section — the blank tab is the intended end state there). Left as a known
 gap rather than guessed at; flag to Aaron if he wants it closed.
 
+**Optional per-override element focus, `focusSelector` (2026-09-02, UNCONFIRMED
+until live-tested).** A `NEW_TAB_OVERRIDES` entry can now be `{url,
+focusSelector}` instead of a plain url string (a plain string still works —
+`focusSelector` defaults to none via `getNewTabOverride`). If set, once the
+redirected tab reaches `chrome.tabs.onUpdated` status `"complete"`,
+`injectFocusSelector` runs `chrome.scripting.executeScript` in that tab to
+`document.querySelector(selector)?.focus()`, polling (`FOCUS_SELECTOR_POLL_MS`,
+150ms) up to `FOCUS_SELECTOR_TIMEOUT_MS` (8s) rather than trying once, since
+an SPA like claude.ai is typically still hydrating at "complete" and the
+target element often doesn't exist in the DOM yet at that instant.
+
+**This is a materially different mechanism from everything else in this
+file, and needs its own live confirmation.** Every other feature here
+reaches into *Vivaldi's own* privileged UI (the webpack-module-scanning
+technique) — `chrome.scripting.executeScript` instead runs code inside the
+*loaded page's own content* (claude.ai, a separate process), an API this
+project has never used before. There is no `manifest.json` for this
+injected-into-`main.html` context at all (confirmed in the planning doc's
+CDP-era research), so whether `chrome.scripting` is exposed here the way
+`chrome.tabs`/`chrome.windows`/`chrome.contextMenus`/`chrome.storage` are is
+unknown rather than assumed — if it's missing, `injectFocusSelector` logs a
+`[VWH]` console warning (in `main.html`'s own console) and the tab still
+loads normally, just without the focus. `window.__vwh.injectFocusSelector(
+tabId, selector)` is exposed for testing this directly against an
+already-open tab without needing a fresh Cmd+T round-trip.
+
+**Selector corrected 2026-09-02 from Aaron's own DevTools inspection of the
+real element**, after the first guess (`div[contenteditable="true"]`) was
+tried live and didn't focus anything. The actual chat input carries
+`data-testid="chat-input"` — a real test hook, far more likely to stay
+stable across claude.ai deploys than a generic attribute selector, and
+immune to the `querySelector`-returns-first-match risk a bare
+`contenteditable` selector has if any other contenteditable element exists
+anywhere on the page. `NEW_TAB_OVERRIDES.Claude.focusSelector` is now
+`'[data-testid="chat-input"]'`. The injected page-context function
+(`injectFocusSelector`'s `func`) also now logs to **that tab's own**
+console (`[VWH-focus]`, not `main.html`'s `[VWH]`) on both success
+(`"focused"`) and on giving up after `FOCUS_SELECTOR_TIMEOUT_MS` — the
+timeout case was previously silent, which would have masked a wrong
+selector indefinitely; check the claude.ai tab's own DevTools console
+(right-click the page → Inspect, or `vivaldi://inspect/#pages`), not
+`main.html`'s, to see these.
+
+**Root cause found and fixed 2026-09-03: `chrome.tabs.update(tab.id, {url})`
+itself can never move keyboard focus off the address bar, confirmed live
+and by external research, not fixable by any selector/script change.**
+Aaron reported the cursor still stayed in the address bar even after the
+selector fix above — and the tab's own console *did* log
+`[VWH-focus] focused [data-testid="chat-input"]`, proving the script found
+the right element and successfully called `.focus()` on it. That the
+address bar still visibly had the cursor afterward means this was never a
+selector problem: DOM-level `element.focus()` inside a page and actual
+host-level keyboard input focus are different layers, and Chromium-family
+browsers apparently never let an extension's `tabs.update(url)` move
+keyboard focus off the address bar at all — confirmed by Mozilla bug
+1411465 (marked `wontfix`/by-design: *"no API parameter allows developers
+to specify whether focus should go to content or the address bar"* after
+`tabs.update`). A Vivaldi-native setting, Settings → Tabs → "Focus Page
+Content on New Tab", was considered and rejected as the fix — forum reports
+say it only applies to Vivaldi's own genuine Start Page/New Tab Page
+content at tab-creation instant, not a tab whose URL a script silently
+swaps a moment later, which is exactly this codebase's flow.
+
+**Fix**: `redirectNewTabIfConfigured` no longer calls `tabs.update` at all
+— it now recreates the tab via `chrome.tabs.create({windowId, index:
+tab.index, url: override.url, active: true})` followed by
+`chrome.tabs.remove(tab.id)`, then runs the `focusSelectorWhenLoaded`
+injection against the *new* tab's id. This mirrors the exact documented
+workaround for the Firefox bug above (used by the real "New Tab Override"
+extension: recreate rather than update, since only a freshly created tab's
+content gets real focus) — and is also literally the same create+remove
+technique this file already uses in `recreateTabInWindow` to work around a
+different, unrelated `chrome.tabs.move()` bug (Third feature section) — so
+this is the second distinct Vivaldi/Chromium tab-manipulation API found
+broken in this codebase, with the same class of fix both times. No
+infinite-loop risk from the second `onCreated` event this triggers (the
+replacement tab's own `pendingUrl` is `override.url`, not one of
+`BLANK_NEW_TAB_URLS`, so `redirectNewTabIfConfigured`'s own guard
+immediately no-ops on it) — but whether this second `onCreated` event could
+still spuriously interact with the background-tab-routing detector further
+down the same listener is reasoned-through, not yet independently
+live-confirmed (reasoning: the window is necessarily focused, since Cmd+T
+always happens in the focused window, so the detector's own foreground
+check should already see it as non-background) — flag to Aaron if a
+spurious toast/jump ever appears right after a redirected new tab. **Still
+needs a real Cmd+T retest** to confirm the cursor actually lands in the
+chat input now.
+
 ## Debugging
 
 - `vivaldi://inspect/#apps` → find the `main.html` entry (for the watcher) or
@@ -1124,5 +1212,8 @@ gap rather than guessed at; flag to Aaron if he wants it closed.
   `.removeLinkRoutingRules(ids)` are here), `__vwh.addWorkspaceRule(...)`,
   `__vwh.openAddRuleDialogForFocusedWindow()`, `__vwh.jumpToWorkspace(name)`
   (Fifth feature), `__vwh.NEW_TAB_OVERRIDES` (Sixth feature — read-only here;
-  edit the constant in the source file and reinstall to change it).
+  edit the constant in the source file and reinstall to change it),
+  `__vwh.injectFocusSelector(tabId, selector)` (Sixth feature's
+  `focusSelector` option — call directly against an open tab to test a
+  selector without a fresh Cmd+T).
 - Relay logs: `~/Library/Logs/vivaldi-workspace-relay.log`.

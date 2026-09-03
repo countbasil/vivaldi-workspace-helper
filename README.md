@@ -197,13 +197,20 @@ the History menu.
   logs (the watcher/detection logic, both features).
 - `vivaldi://inspect/#apps` → a specific open window → inspect, for
   `[VWH-toast]`-prefixed logs (Feature 2's toast itself).
+- `vivaldi://inspect/#pages` → the actual tab (e.g. claude.ai) → inspect,
+  for `[VWH-focus]`-prefixed logs — Feature 6's `focusSelector` logs
+  *there*, in the loaded page's own console, not `main.html`'s, since the
+  focus injection runs inside that page's content process.
 - `window.__vwh` is exposed at runtime in `main.html`'s console:
   `__vwh.workspaceStore`, `__vwh.lastRoutedTab`, `__vwh.jumpToLastRoutedTab()`,
   `__vwh.linkRoutesController` (Feature 5's rules API, `.getRules()`/
   `.addLinkRoutingRule(type, expression, workspaceId)`/
   `.removeLinkRoutingRules(ids)`), `__vwh.addWorkspaceRule(...)`,
   `__vwh.openAddRuleDialogForFocusedWindow()`, `__vwh.jumpToWorkspace(name)`
-  (Feature 3's relay-based path).
+  (Feature 3's relay-based path), `__vwh.NEW_TAB_OVERRIDES` (Feature 6,
+  read-only — edit the constant in the source file and reinstall to
+  change it), `__vwh.injectFocusSelector(tabId, selector)` (Feature 6 —
+  test a `focusSelector` directly against an already-open tab).
 - Relay connection state/errors: `~/Library/Logs/vivaldi-workspace-relay.log`.
 
 ---
@@ -473,15 +480,26 @@ by editing the source file directly**, not through any in-browser UI:
 ```js
 // injected/workspace-route-watcher.js
 const NEW_TAB_OVERRIDES = {
-  Claude: "https://claude.ai",
+  Claude: { url: "https://claude.ai", focusSelector: '[data-testid="chat-input"]' },
 };
 ```
 
 Add one entry per workspace name (must match the real workspace name
-exactly) → URL you want Cmd+T to open there, then re-run
+exactly) → the URL you want Cmd+T to open there, then re-run
 `injected/install.sh` and restart Vivaldi. There's deliberately no dialog or
 settings UI for this, unlike the other features — it's meant for the couple
-of workspaces you'd actually want it for, not general configuration.
+of workspaces you'd actually want it for, not general configuration. A
+value can also just be a plain URL string (`Claude: "https://claude.ai"`)
+if you don't need the focus behavior below.
+
+**Optional: `focusSelector` also puts the cursor in a specific element**,
+so e.g. Cmd+T in the Claude workspace lands you ready to type in the chat
+box, not the address bar. Give it a CSS selector for the element to focus
+once the page loads (get one via right-click the element → Inspect →
+right-click it in DevTools → Copy → Copy selector — prefer a stable
+attribute like `data-testid` over a generated positional selector, which
+breaks the next time the page's markup changes). Omit the field (or use the
+plain-string form above) to skip this and just open the URL.
 
 **How it works.** A brand-new tab reports one of two placeholder URLs the
 instant it's created, depending on how it was opened — a real Cmd+T settles
@@ -493,6 +511,18 @@ displaying a workspace with an entry above — but skips any tab that has an
 `openerTabId` set (i.e. opened by a page's own JavaScript, like an OAuth
 popup), so a legitimate blank popup a site opens for itself is never
 hijacked.
+
+The redirect itself recreates the tab (`chrome.tabs.create()` with the
+target URL, then removes the original) rather than just updating the
+existing blank tab's URL in place. That's not incidental — an in-place
+`chrome.tabs.update(tab.id, {url})` was tried first and confirmed live to
+leave real keyboard focus stuck in the address bar no matter what, even
+when a `focusSelector` successfully found and `.focus()`'d the right
+element in the page. This turns out to be a known, by-design Chromium/
+Firefox limitation (no extension API lets a plain URL update move focus off
+the address bar), not something fixable by trying harder at the DOM level;
+recreating the tab is the documented workaround, and only a freshly created
+tab's content actually receives real focus.
 
 **Known gap.** A workspace's *brand-new* window — the one created the first
 time you jump to a workspace that doesn't have one yet (Features 3/4/5) —

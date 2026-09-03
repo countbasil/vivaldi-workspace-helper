@@ -44,7 +44,12 @@
 // A sixth, unrelated capability lives here too: NEW_TAB_OVERRIDES lets one
 // or two specific workspaces get their own Cmd+T destination (e.g. the
 // "Claude" workspace always opening claude.ai) instead of Vivaldi's single
-// global New Tab Page setting -- see redirectNewTabIfConfigured below.
+// global New Tab Page setting -- see redirectNewTabIfConfigured below. It
+// can also focus a CSS selector on that page once loaded (focusSelector),
+// via chrome.scripting.executeScript -- unlike everything else in this
+// file, that reaches into the *loaded page's own content*, not Vivaldi's
+// internal UI, so its availability in this context is unconfirmed; see the
+// comment on NEW_TAB_OVERRIDES itself.
 //
 // HOW MODULE DISCOVERY WORKS
 // --------------------------
@@ -96,9 +101,30 @@
   // every hand-configured spot. Only workspaces listed here are affected;
   // everywhere else, Vivaldi's own New Tab Page setting is untouched. Edit
   // this map and re-run injected/install.sh + restart Vivaldi to apply.
+  //
+  // A value can be a plain url string, or {url, focusSelector} -- the
+  // latter also focuses the matching element (via CSS selector) once the
+  // page loads, so e.g. Cmd+T in the Claude workspace lands the cursor in
+  // the chat input instead of the URL bar (2026-09-02). focusSelector is
+  // UNCONFIRMED as a mechanism -- everywhere else in this file reaches into
+  // Vivaldi's own privileged UI via the webpack-scanning trick, but
+  // focusing an element on the *loaded page itself* (claude.ai, a separate
+  // process) needs chrome.scripting.executeScript, which nothing in this
+  // project has used before and which may not even be exposed to this
+  // unmanifested main.html context -- see focusSelectorWhenLoaded below.
+  // Needs a real Cmd+T live test before trusting it; check the console for
+  // [VWH] warnings if the cursor doesn't land where expected. The selector
+  // below is a guess (claude.ai's chat box is a ProseMirror contenteditable
+  // div) -- if wrong, open claude.ai, right-click the input box -> Inspect,
+  // right-click the highlighted element in DevTools -> Copy -> Copy selector.
   const NEW_TAB_OVERRIDES = {
-    Claude: "https://claude.ai",
+    Claude: { url: "https://claude.ai", focusSelector: '[data-testid="chat-input"]' },
   };
+  function getNewTabOverride(workspaceName) {
+    const entry = NEW_TAB_OVERRIDES[workspaceName];
+    if (!entry) return null;
+    return typeof entry === "string" ? { url: entry, focusSelector: null } : entry;
+  }
 
   let workspaceStore = null;
   let linkRoutesController = null;
@@ -262,7 +288,7 @@
   // with its window -- not applicable to a tab that was just born in this
   // window and has no membership of its own yet).
   const BLANK_NEW_TAB_URLS = new Set(["chrome://newtab/", "about:blank"]);
-  function redirectNewTabIfConfigured(tab) {
+  async function redirectNewTabIfConfigured(tab) {
     // "about:blank" is a much more generic signal than "chrome://newtab/"
     // was on its own -- a page's own window.open() call (no URL yet,
     // navigated moments later by that page's own JS, e.g. an OAuth popup)
@@ -280,9 +306,91 @@
     if (workspaceId == null) return;
     const ws = workspaceStore.getWorkspaceById(workspaceId);
     if (!ws) return;
-    const overrideUrl = NEW_TAB_OVERRIDES[ws.name];
-    if (!overrideUrl) return;
-    chrome.tabs.update(tab.id, { url: overrideUrl });
+    const override = getNewTabOverride(ws.name);
+    if (!override) return;
+
+    // NOT chrome.tabs.update(tab.id, {url}) -- confirmed live (2026-09-03)
+    // that it leaves real keyboard focus in the address bar no matter what,
+    // even though the focusSelector injection below successfully found and
+    // .focus()'d the actual chat input inside the page (proving this is a
+    // browser-chrome focus layer tabs.update can't reach, not a
+    // selector/script problem). Matches Mozilla bug 1411465 (marked
+    // wontfix/by-design for Firefox: "no API parameter allows developers to
+    // specify whether focus should go to content or the address bar" after
+    // tabs.update with a url). Their documented workaround, used by the real
+    // "New Tab Override" extension: recreate the tab via tabs.create()
+    // instead -- a freshly created tab's content gets real focus, an
+    // address-bar update never does. Same create+remove technique this file
+    // already uses for a different tabs.move() bug -- see
+    // recreateTabInWindow's own comment. index:tab.index keeps it in the
+    // same tab-strip position rather than jumping to the end.
+    //
+    // Not yet independently confirmed live whether the new tabs.create()
+    // call here (a *second* onCreated event, for the replacement tab) could
+    // interact with the background-tab-routing detector further down this
+    // same onCreated listener -- reasoning says no (this window is
+    // necessarily focused, since Cmd+T always happens in the focused
+    // window, so the detector's own focus check should see it as
+    // foreground), but flag to Aaron if a spurious toast/jump ever appears
+    // right after a redirected new tab.
+    const newTab = await callChrome(chrome.tabs, "create", {
+      windowId: tab.windowId,
+      index: tab.index,
+      url: override.url,
+      active: true,
+    });
+    await callChrome(chrome.tabs, "remove", tab.id);
+    if (override.focusSelector) focusSelectorWhenLoaded(newTab.id, override.focusSelector);
+  }
+
+  // Focuses override.focusSelector inside the tab once it finishes loading.
+  // Polls rather than firing once at "complete", since a single-page app
+  // (claude.ai) is typically still hydrating at that point -- the element
+  // this targets often doesn't exist in the DOM yet even once Chromium
+  // considers the navigation itself "complete".
+  const FOCUS_SELECTOR_TIMEOUT_MS = 8000;
+  const FOCUS_SELECTOR_POLL_MS = 150;
+  function focusSelectorWhenLoaded(tabId, selector) {
+    function onUpdated(updatedTabId, changeInfo) {
+      if (updatedTabId !== tabId || changeInfo.status !== "complete") return;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      injectFocusSelector(tabId, selector);
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  }
+
+  function injectFocusSelector(tabId, selector) {
+    if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+      console.warn(TAG, "chrome.scripting.executeScript unavailable in this context -- cannot focus", selector);
+      return;
+    }
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        func: (sel, timeoutMs, pollMs) => {
+          const start = Date.now();
+          (function tryFocus() {
+            const el = document.querySelector(sel);
+            if (el) {
+              el.focus();
+              console.log("[VWH-focus] focused", sel);
+              return;
+            }
+            if (Date.now() - start < timeoutMs) {
+              setTimeout(tryFocus, pollMs);
+            } else {
+              console.warn("[VWH-focus] gave up looking for", sel, "after", timeoutMs, "ms");
+            }
+          })();
+        },
+        args: [selector, FOCUS_SELECTOR_TIMEOUT_MS, FOCUS_SELECTOR_POLL_MS],
+      },
+      () => {
+        if (chrome.runtime.lastError) {
+          console.warn(TAG, "focus-selector injection failed:", chrome.runtime.lastError.message);
+        }
+      }
+    );
   }
 
   function getDomain(url) {
@@ -1300,7 +1408,7 @@
       // Independent of everything below -- runs for every new tab
       // regardless of the recreated-tab marker (that marker exists to avoid
       // *background-routing* misdetection specifically, not relevant here).
-      redirectNewTabIfConfigured(tab);
+      redirectNewTabIfConfigured(tab).catch((e) => console.warn(TAG, "redirectNewTabIfConfigured failed:", e));
 
       // Our own recreateTabInWindow (jumpToTab, moveTabsToWorkspace) landing
       // a tab it created itself -- not a real external/background route. See
@@ -1437,6 +1545,7 @@
       openAddRuleDialogForFocusedWindow,
       jumpToWorkspace,
       NEW_TAB_OVERRIDES,
+      injectFocusSelector,
     };
     console.log(TAG, "Ready");
   }
