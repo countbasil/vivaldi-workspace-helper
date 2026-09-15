@@ -875,15 +875,59 @@
   // tab's own back/forward history and any in-page JS state (e.g. unsaved
   // form input) -- real costs, but far smaller than landing a tab you can
   // never get back to.
-  async function recreateTabInWindow(tab, windowId, active) {
+  // appendToEnd is optional -- when falsy, Vivaldi's own "open new tabs"
+  // setting decides placement (e.g. next to the active tab), which is what
+  // jumpToTab wants (a single routed tab, no ordering complaint).
+  // moveTabsToWorkspace passes true to force append-at-the-end regardless of
+  // that setting -- see its own call site for why.
+  //
+  // 2026-09-14: originally this passed an explicit `index` (the destination
+  // window's current tab count) straight to chrome.tabs.create, but Aaron
+  // found live that this didn't land at the bottom reliably -- landed in
+  // different places across repeated trials. A same-window chrome.tabs.move
+  // to index -1 (tabs.move's own documented "end of window" sentinel) after
+  // creation was tried next, on the theory that Vivaldi's own placement
+  // logic was silently overriding tabs.create's index request at creation
+  // time (the same class of bug already found here for chrome.tabs.move
+  // cross-window and tabs.update(url)'s focus). That's kept below, but
+  // Aaron identified a second, independent mechanism it doesn't cover:
+  // Settings -> Tabs has a separate "open tabs in current tab stack" option
+  // (distinct from "new tab position: as tab stack with related tab", which
+  // Aaron confirmed is off) -- if the destination window's currently *active*
+  // tab happens to be part of a stack, a plain chrome.tabs.create joins the
+  // new tab into that stack, wherever the stack sits in the tab strip, which
+  // would explain landing in different places across trials depending on
+  // which tab was active there. Fixed per Aaron's own suggested workaround:
+  // explicitly select the window's actual last tab *before* creating, so
+  // that whatever stack-join behavior fires is at least anchored to the end
+  // of the tab strip -- if that last tab is itself stacked, the moved tab
+  // predictably joins that end stack (an accepted, understood outcome, not
+  // a bug) rather than landing in an arbitrary stack elsewhere; if it isn't
+  // stacked, the moved tab simply lands right after it with no stack
+  // involvement at all. Selecting a tab via chrome.tabs.update({active:true})
+  // only changes which tab is selected *within* that window, not window
+  // focus (chrome.windows.update's job) -- doesn't disturb
+  // moveTabsToWorkspace's "stay on the source window" design.
+  // Not yet reconfirmed live after this change -- see the CLAUDE.md note.
+  async function recreateTabInWindow(tab, windowId, active, appendToEnd) {
     markWindowReceivingOwnTab(windowId);
     try {
+      if (appendToEnd) {
+        const existingTabs = await callChrome(chrome.tabs, "query", { windowId });
+        if (existingTabs.length) {
+          const lastTab = existingTabs.reduce((a, b) => (b.index > a.index ? b : a));
+          await callChrome(chrome.tabs, "update", lastTab.id, { active: true });
+        }
+      }
       const newTab = await callChrome(chrome.tabs, "create", {
         windowId,
         url: tab.url,
         active: !!active,
         pinned: tab.pinned,
       });
+      if (appendToEnd) {
+        await callChrome(chrome.tabs, "move", newTab.id, { index: -1 });
+      }
       await callChrome(chrome.tabs, "remove", tab.id);
       return newTab.id;
     } finally {
@@ -986,8 +1030,16 @@
       // tab's group membership at all). Each tab keeps its own original
       // `active` state, so whichever one was already active ends up the
       // only one active in the new window too.
+      //
+      // appendToEnd: true (2026-09-14, per Aaron's feedback): without it,
+      // chrome.tabs.create falls back to Vivaldi's own "open new tabs" setting,
+      // which lands the recreated tab next to the destination's active tab
+      // rather than at the end -- surprising for a tab the user is deliberately
+      // moving to sit alongside that workspace's existing tabs. See
+      // recreateTabInWindow's own comment for why this is a post-creation
+      // chrome.tabs.move rather than an index passed to chrome.tabs.create.
       for (const tab of tabs) {
-        await recreateTabInWindow(tab, targetWindowId, tab.active);
+        await recreateTabInWindow(tab, targetWindowId, tab.active, true);
       }
     }
     await closeDefaultTabIfSafe(targetWindowId, defaultTabId);

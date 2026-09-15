@@ -516,6 +516,75 @@ still being in A. Fixed:
   alongside the per-workspace move macros, for jumping to wherever the last
   move landed without having to still see its toast.
 
+### Moved tabs now land at the end of the destination tab list (2026-09-14)
+
+Per Aaron's feedback: tabs moved via the Keyboard Maestro macro
+(`moveSelectedTabsToWorkspace`/`moveTabsToWorkspace`) were landing wherever
+Vivaldi's own "open new tabs" setting puts a freshly-created tab (e.g. next
+to the destination window's active tab), since `recreateTabInWindow`'s
+`chrome.tabs.create` call never specified a position.
+
+**First attempt (same day) didn't hold up under real testing.**
+`recreateTabInWindow` initially took an explicit `index` (the destination
+window's live tab count, re-queried on each iteration) passed straight
+into `chrome.tabs.create`. Aaron tested it live and reported it "not going
+to bottom reliably... seen in multiple places on multiple trials" — not a
+one-off race, an inconsistent result across repeated real moves.
+
+**Fixed by not trusting `chrome.tabs.create`'s `index` at all.** This is
+the same class of bug this file has already hit twice before for other
+tab-manipulation APIs under Vivaldi — `chrome.tabs.move` silently breaking
+cross-window (the original reason `recreateTabInWindow` exists at all),
+and `tabs.update(url)` never actually moving keyboard focus (Sixth
+feature) — Vivaldi's own tab-placement logic can override what the
+extension API requests at *creation* time, and evidently does so
+inconsistently rather than deterministically. `recreateTabInWindow` now
+takes a boolean `appendToEnd` instead of a numeric `index`: it creates the
+tab with no position hint (unaffected for `jumpToTab`'s single-tab case,
+which passes `appendToEnd: false` implicitly and has no ordering
+complaint), then — only when `appendToEnd` is true — issues a *separate*
+`chrome.tabs.move(newTab.id, { index: -1 })` call. `-1` is tabs.move's own
+documented sentinel for "place at the end of the window", a stronger
+guarantee than tabs.create's `index` (which the docs only describe as
+"clamped between zero and the tab count", not a real end-of-list
+sentinel). Critically, this is a plain *same-window* reorder, not the
+cross-window move already confirmed broken here, so it's a different
+underlying operation from the one `recreateTabInWindow` was built to
+route around in the first place. `moveTabsToWorkspace`'s loop now just
+passes `true` for every tab instead of computing a count.
+
+**Second attempt, same day, per Aaron's own diagnosis of the real
+mechanism.** The "automatically create tab stacks" guess above (asked to
+Aaron directly) turned out not quite right — Aaron clarified the relevant
+Settings → Tabs option is actually "new tab position: as tab stack with
+related tab" (confirmed off for him) versus a *separate* option, "open
+tabs in current tab stack". His own diagnosis: if the destination window's
+currently *active* tab happens to be part of a stack at the moment
+`chrome.tabs.create` runs, that second setting joins the new tab into
+whatever stack the active tab belongs to — wherever that stack sits in the
+tab strip, not necessarily the end — which would explain landing in
+different places across trials depending purely on which tab was active
+there at the time (something this code never controlled). Fixed exactly
+per Aaron's own suggested workaround: `recreateTabInWindow` now explicitly
+selects the destination window's actual *last* tab (`chrome.tabs.update(
+lastTab.id, { active: true })`, found via a fresh query for the tab with
+the highest `index`) immediately before creating — this only changes which
+tab is selected *within* that window (unrelated to `chrome.windows.update`'s
+`focused`), so it doesn't disturb `moveTabsToWorkspace`'s "stay on the
+source window" design. If that last tab is itself stacked, the moved tab
+now predictably joins that *end* stack — in Aaron's own words, "at least it
+will be obvious where it is" — rather than an arbitrary stack elsewhere;
+if it isn't stacked, the moved tab lands right after it with no stack
+involvement. The `chrome.tabs.move(..., { index: -1 })` call from the first
+fix is kept as a belt-and-suspenders flat-order enforcement afterward,
+since it's a plain reorder that shouldn't interact with `vivExtData`'s
+proprietary stack `group` field either way (see the Fourth feature's
+"Not a bug" note on why no extension API can touch that field at all).
+
+**Not yet independently reconfirmed live after this second attempt** —
+flag to Aaron again if a real move still doesn't land at the bottom (or
+doesn't land in the expected end-stack when the last tab is stacked).
+
 ## Fourth feature: add a workspace routing rule from inside the browser (2026-08-24)
 
 A dialog for adding a new "open in workspace" routing rule (Settings →
