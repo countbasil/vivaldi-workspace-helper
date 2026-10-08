@@ -909,6 +909,21 @@
   // focus (chrome.windows.update's job) -- doesn't disturb
   // moveTabsToWorkspace's "stay on the source window" design.
   // Not yet reconfirmed live after this change -- see the CLAUDE.md note.
+  //
+  // ignoreLinkRouting: true (2026-10-07): without it, chrome.tabs.create runs
+  // the new tab's URL through Vivaldi's own workspace rules, so a tab whose
+  // URL matches a rule for some *other* workspace gets yanked straight back
+  // out of the destination window. Aaron hit this moving two doximity.com
+  // tabs from Work to Home with a "doximity.com -> Work" rule in place: the
+  // recreated tabs were routed right back into the Work window, and the
+  // background-tab detector then saw an active tab "routed" into an
+  // unfocused window and auto-jumped there, popping Work back to the front.
+  // Reproducible every time for those specific tabs, not a race. Not an
+  // undocumented hack: ignoreLinkRouting is a declared optional property of
+  // tabs.create in Vivaldi's own tabs API schema (in the Vivaldi Framework
+  // binary), and bundle.js's own "open link in workspace X" context menu
+  // passes exactly this flag for the same reason -- the destination
+  // workspace was chosen explicitly, so rules must not override it.
   async function recreateTabInWindow(tab, windowId, active, appendToEnd) {
     markWindowReceivingOwnTab(windowId);
     try {
@@ -924,6 +939,7 @@
         url: tab.url,
         active: !!active,
         pinned: tab.pinned,
+        ignoreLinkRouting: true,
       });
       if (appendToEnd) {
         await callChrome(chrome.tabs, "move", newTab.id, { index: -1 });

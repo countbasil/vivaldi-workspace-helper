@@ -585,6 +585,36 @@ proprietary stack `group` field either way (see the Fourth feature's
 flag to Aaron again if a real move still doesn't land at the bottom (or
 doesn't land in the expected end-stack when the last tab is stacked).
 
+### Moved tabs were being routed back by workspace rules (2026-10-07)
+
+Aaron reported that moving a multi-tab selection sometimes popped the
+source window back to the front partway through, with the last couple of
+tabs ending up back in the source window. Moving just those leftover tabs
+again did the same thing every time, so it was tab-specific, not a race.
+They were two `doximity.com` tabs being moved from Work to Home, and a
+`CONTAINS doximity.com → Work` workspace rule was in place. Because
+`recreateTabInWindow` moves tabs with `chrome.tabs.create`, each new tab's
+URL went through Vivaldi's link routing, which sent it straight back to
+the Work window. The background-tab detector then saw an active tab land
+in an unfocused window, treated it as a foreground route, and called
+`jumpToTab`, which raised Work. The detector didn't skip it because the
+`windowsReceivingOwnRecreatedTabs` mark is keyed on the *destination*
+window, not on Work.
+
+**Fix:** `recreateTabInWindow` now passes `ignoreLinkRouting: true` to
+`chrome.tabs.create`. This is a real, declared optional `tabs.create`
+property in Vivaldi's own extension API schema (found in the
+`Vivaldi Framework` binary via `strings`), not an undocumented hack.
+Vivaldi's own "open link in workspace X" context menu passes the same flag
+from `bundle.js`'s `newTab` helper, for the same reason: the destination
+was chosen explicitly, so rules mustn't override it. The same schema
+also lists `vivExtData` as a `tabs.create` property, and Vivaldi's own
+`newTab` sets `{workspaceId, group}` through it. That's untested here and
+not used yet. `tabs.update` was confirmed live to ignore `vivExtData` (see
+the "Not a bug" stack note above), but `create` may still honor it, which
+would make it the obvious lever if a moved tab's workspace tag or stack
+ever needs setting explicitly.
+
 ## Fourth feature: add a workspace routing rule from inside the browser (2026-08-24)
 
 A dialog for adding a new "open in workspace" routing rule (Settings →
