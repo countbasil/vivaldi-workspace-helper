@@ -1395,6 +1395,7 @@
     socket.addEventListener("open", () => {
       console.log(TAG, "Connected to relay on port", RELAY_PORT);
       relayRetryDelay = 1000;
+      sendRelayHello(socket);
     });
     socket.addEventListener("message", async (event) => {
       let msg;
@@ -1439,6 +1440,27 @@
     socket.addEventListener("close", scheduleRelayRetry);
     socket.addEventListener("error", () => {
       /* "close" fires right after and drives the retry */
+    });
+  }
+
+  // Tells the relay which copy of this script it's talking to. Opening a
+  // private window makes Vivaldi load a second main.html (with this script)
+  // for the incognito profile, confirmed live 2026-10-17. That copy only
+  // sees private windows. The relay logs this hello and uses
+  // incognito/startedAt to route HTTP requests to the regular copy (see
+  // pickBrowserSocket in relay/server.js).
+  function sendRelayHello(socket) {
+    chrome.windows.getAll({}, (wins) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(
+        JSON.stringify({
+          type: "hello",
+          incognito: !!(chrome.extension && chrome.extension.inIncognitoContext),
+          startedAt: Math.round(performance.timeOrigin),
+          href: location.href,
+          windows: (wins || []).map((w) => ({ incognito: w.incognito, type: w.type })),
+        })
+      );
     });
   }
 

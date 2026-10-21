@@ -24,7 +24,7 @@
   // which can't fully distinguish that from a routed tab's in-place
   // reassignment), where an 8s lingering toast for your own deliberate
   // action was actively annoying.
-  const TOAST_DURATION_MS = 8000;
+  const TOAST_DURATION_MS = 5000;
   const INFORMATIONAL_TOAST_DURATION_MS = 2500;
   // Background opacity, 0 (fully see-through) to 1 (fully solid). Text stays
   // solid either way -- this only affects how much of the page behind shows
@@ -72,17 +72,19 @@
   // tab strip), and whatever chrome occupies that gap sits in front of a
   // window-relative toast, silently eating clicks meant for it (only the
   // portion of the toast actually over the content viewport was
-  // clickable). Anchoring to the content viewport's own rect instead --
-  // matching what was actually asked for, "upper right of the web content
-  // viewport" -- fixes this regardless of tab-strip/panel configuration.
-  // Falls back to the window's own top-right if no viewport is found.
+  // clickable). Anchoring to the content viewport's own rect instead fixes
+  // this regardless of tab-strip/panel configuration. The toast is centered
+  // in that rect (changed 2026-10-21 from its upper-right corner, per
+  // Aaron's request -- same reason as the add-rule dialog below: top-right
+  // is where macOS notifications land too). Falls back to the whole window
+  // if no viewport is found.
   function getContentViewportRect() {
     const views = document.querySelectorAll(".webpageview, webview");
     for (const el of views) {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) return rect;
     }
-    return { top: 0, right: window.innerWidth };
+    return { top: 0, left: 0, width: window.innerWidth, height: window.innerHeight };
   }
 
   function dismissToast() {
@@ -136,15 +138,16 @@
     }
 
     const viewport = getContentViewportRect();
-    const top = Math.round(viewport.top) + 8;
-    const right = Math.round(window.innerWidth - viewport.right) + 8;
+    const centerX = Math.round(viewport.left + viewport.width / 2);
+    const centerY = Math.round(viewport.top + viewport.height / 2);
 
     const el = document.createElement("div");
     el.id = "vwh-toast";
     el.style.cssText = [
       "position: fixed",
-      `top: ${top}px`,
-      `right: ${right}px`,
+      `top: ${centerY}px`,
+      `left: ${centerX}px`,
+      "transform: translate(-50%, -50%)",
       "z-index: 2147483647",
       `background: rgba(32, 32, 36, ${TOAST_OPACITY})`,
       "color: #fff",
@@ -178,11 +181,87 @@
       el.textContent = `${message.domain} tab opened in ${emoji} ${workspaceLabel}\n\nClick or press Tab to switch`;
     }
 
-    if (interactive) {
-      el.addEventListener("click", jumpToActiveTarget);
-    } else {
-      el.addEventListener("click", dismissToast);
-    }
+    // Set by the drag handler below; swallows the click the browser still
+    // fires on pointerup after a drag, so dropping the toast somewhere
+    // doesn't also count as clicking it (which would jump/dismiss).
+    let justDragged = false;
+    const durationMs = interactive ? TOAST_DURATION_MS : INFORMATIONAL_TOAST_DURATION_MS;
+
+    el.addEventListener("click", () => {
+      if (justDragged) {
+        justDragged = false;
+        return;
+      }
+      if (interactive) jumpToActiveTarget();
+      else dismissToast();
+    });
+
+    // Draggable (2026-10-21, per Aaron). Pointer capture keeps move events
+    // coming even when the cursor passes over the <webview>, a separate
+    // process that would otherwise swallow them. The auto-dismiss timer is
+    // cleared for the duration of a drag and restarted on drop, so the toast
+    // can't vanish out from under the cursor.
+    el.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const rect = el.getBoundingClientRect();
+      let dragging = false;
+      el.setPointerCapture(e.pointerId);
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (!dragging) {
+          if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return; // still a click
+          dragging = true;
+          clearTimeout(dismissTimer);
+          // Swap the centering transform for explicit pixel coordinates.
+          el.style.transform = "none";
+        }
+        el.style.left = `${rect.left + dx}px`;
+        el.style.top = `${rect.top + dy}px`;
+      };
+      const onUp = () => {
+        el.removeEventListener("pointermove", onMove);
+        el.removeEventListener("pointerup", onUp);
+        el.removeEventListener("pointercancel", onUp);
+        if (dragging) {
+          justDragged = true;
+          dismissTimer = setTimeout(dismissToast, durationMs);
+        }
+      };
+      el.addEventListener("pointermove", onMove);
+      el.addEventListener("pointerup", onUp);
+      el.addEventListener("pointercancel", onUp);
+    });
+
+    // Close button, overhanging the upper-left corner so it never overlaps
+    // the text. Dismiss only -- never triggers the jump, even on an
+    // interactive toast.
+    const closeBtn = document.createElement("div");
+    closeBtn.textContent = "×";
+    closeBtn.style.cssText = [
+      "position: absolute",
+      "top: -8px",
+      "left: -8px",
+      "width: 18px",
+      "height: 18px",
+      "line-height: 16px",
+      "text-align: center",
+      "font-size: 14px",
+      "border-radius: 50%",
+      "background: rgba(32, 32, 36, 0.95)",
+      "border: 1px solid rgba(255,255,255,0.35)",
+      "color: #fff",
+      "cursor: pointer",
+    ].join(";");
+    closeBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      dismissToast();
+    });
+    el.appendChild(closeBtn);
 
     document.body.appendChild(el);
     toastEl = el;
@@ -233,14 +312,14 @@
       document.addEventListener("keydown", toastKeydownHandler);
     }
 
-    dismissTimer = setTimeout(dismissToast, interactive ? TOAST_DURATION_MS : INFORMATIONAL_TOAST_DURATION_MS);
+    dismissTimer = setTimeout(dismissToast, durationMs);
   }
 
   // ---------- add-rule dialog (Feature 5) ----------
   //
   // Broadcast by workspace-route-watcher.js's showAddRuleDialog, same
   // displayWindowId-gated pattern as the toast above. Centered on the
-  // window (unlike the toast's top-right-of-viewport anchor) -- top-right
+  // window (the toast was top-right of the viewport at the time) -- top-right
   // is also where macOS notifications land, and they partly covered this
   // dialog there per Aaron's feedback (2026-08-25). A full-viewport
   // transparent backdrop provides click-outside-to-dismiss without needing
@@ -347,7 +426,7 @@
     el.style.cssText = [
       "position: fixed",
       // Centered on the window, not anchored to the content viewport's
-      // top-right like the toast -- per Aaron's feedback (2026-08-25), the
+      // top-right like the toast was then -- per Aaron's feedback (2026-08-25), the
       // top-right corner is where macOS notifications land too, and they
       // partly covered the dialog there.
       "top: 50%",

@@ -92,17 +92,79 @@ tell application "System Events"
 	end tell
 end tell
 `;
-  execFile("osascript", ["-e", script], (error) => callback(error));
+  execFile("osascript", ["-e", script], (error, stdout, stderr) => {
+    // Logged here because the only other place this error surfaces is the
+    // HTTP response, which hotkey callers (`curl -s` in Keyboard Maestro)
+    // discard. Most likely cause when it fails: macOS Accessibility
+    // permission for the node binary running this process. That grant is
+    // tied to the versioned Cellar path, so every `brew upgrade node`
+    // silently revokes it (found 2026-10-16).
+    if (error) {
+      console.log(new Date().toISOString(), `activateWorkspace "${workspaceName}" failed:`, (stderr || String(error)).trim());
+    }
+    callback(error);
+  });
 }
 
-let browserSocket = null;
+// Every connected copy of the injected script, socket -> info. There can be
+// more than one at a time: every private window session loads its own
+// main.html with the script in it (confirmed 2026-10-17). This used to be a single
+// `browserSocket` where each new connection terminated the previous one.
+// With two live clients that turned into a ping-pong: the kicked client
+// reconnects 1s later (its retry delay resets on every successful open) and
+// kicks the other, which does the same. Result: ~1 reconnect/sec for hours,
+// a 21MB log, and any request or activateWorkspace reply in flight when a
+// socket was killed got silently lost. Now every client keeps its own stable
+// connection, and pickBrowserSocket chooses which one gets HTTP requests.
+// Dead sockets (e.g. a half-open connection after sleep, the case the old
+// terminate-on-new rule handled implicitly) are reaped by the heartbeat
+// below instead.
+const clients = new Map();
+let nextClientNumber = 1;
+let lastPickedSocket = null;
 let nextRequestId = 1;
 const pending = new Map(); // requestId -> resolve(result)
+const HEARTBEAT_MS = 30000;
+
+function describeClient(info) {
+  const h = info.hello;
+  if (!h) return `#${info.number} (no hello yet)`;
+  const wins = Array.isArray(h.windows) ? h.windows.map((w) => (w.incognito ? "private" : "normal") + ":" + w.type).join(",") : "?";
+  return `#${info.number} incognito=${h.incognito} startedAt=${h.startedAt} windows=[${wins}] href=${h.href}`;
+}
+
+// Prefer a client that isn't running in a private-window (incognito)
+// context: there, the chrome.* APIs only see private windows, so a "move the
+// focused window's tabs" request would act on the wrong set of windows.
+// Among the rest, prefer the longest-running page (earliest startedAt): the
+// regular profile's main.html loads at browser startup and lives for the
+// whole session, while extra copies come and go. Clients that haven't sent a
+// hello yet (an old injected script that predates it) fall back to their
+// connection time.
+function pickBrowserSocket() {
+  let best = null;
+  for (const [socket, info] of clients) {
+    if (socket.readyState !== socket.OPEN) continue;
+    const incognito = info.hello ? !!info.hello.incognito : false;
+    const started = info.hello && info.hello.startedAt ? info.hello.startedAt : info.connectedAt;
+    const rank = [incognito ? 1 : 0, started];
+    if (!best || rank[0] < best.rank[0] || (rank[0] === best.rank[0] && rank[1] < best.rank[1])) {
+      best = { socket, info, rank };
+    }
+  }
+  const socket = best ? best.socket : null;
+  if (socket && socket !== lastPickedSocket && clients.size > 1) {
+    console.log(new Date().toISOString(), "Routing requests to client", describeClient(best.info));
+  }
+  lastPickedSocket = socket;
+  return socket;
+}
 
 // Shared by every endpoint that forwards a request to the browser side and
 // waits for its response -- handleJumpLastRouted and
 // handleMoveSelectedTabsToWorkspace below just supply the message.
 function sendBrowserRequest(res, message) {
+  const browserSocket = pickBrowserSocket();
   if (!browserSocket) {
     res.writeHead(503, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false, reason: "NOT_CONNECTED" }));
@@ -111,12 +173,14 @@ function sendBrowserRequest(res, message) {
   const requestId = String(nextRequestId++);
   const timer = setTimeout(() => {
     pending.delete(requestId);
+    console.log(new Date().toISOString(), `${message.type} timed out`);
     res.writeHead(504, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false, reason: "TIMEOUT" }));
   }, REQUEST_TIMEOUT_MS);
 
   pending.set(requestId, (result) => {
     clearTimeout(timer);
+    if (!result.ok) console.log(new Date().toISOString(), `${message.type} failed:`, JSON.stringify(result));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result));
   });
@@ -178,19 +242,23 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: "/bridge" });
 
 wss.on("connection", (socket) => {
-  if (browserSocket && browserSocket !== socket) {
-    try {
-      browserSocket.terminate();
-    } catch (e) {}
-  }
-  browserSocket = socket;
-  console.log(new Date().toISOString(), "Vivaldi connected");
+  const info = { number: nextClientNumber++, connectedAt: Date.now(), hello: null, alive: true };
+  clients.set(socket, info);
+  console.log(new Date().toISOString(), `Vivaldi connected (client #${info.number}, ${clients.size} connected)`);
+  socket.on("pong", () => {
+    info.alive = true;
+  });
 
   socket.on("message", (data) => {
     let msg;
     try {
       msg = JSON.parse(data.toString());
     } catch (e) {
+      return;
+    }
+    if (msg.type === "hello") {
+      info.hello = msg;
+      console.log(new Date().toISOString(), "Client identified:", describeClient(info));
       return;
     }
     if (msg.type === "activateWorkspace") {
@@ -214,13 +282,28 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
-    if (browserSocket === socket) {
-      browserSocket = null;
-      console.log(new Date().toISOString(), "Vivaldi disconnected");
-    }
+    clients.delete(socket);
+    if (lastPickedSocket === socket) lastPickedSocket = null;
+    console.log(new Date().toISOString(), `Vivaldi disconnected (client #${info.number}, ${clients.size} connected)`);
   });
   socket.on("error", () => {});
 });
+
+// Reaps connections that died without a clean close (e.g. across sleep), so
+// pickBrowserSocket never routes a request into a dead socket.
+setInterval(() => {
+  for (const [socket, info] of clients) {
+    if (!info.alive) {
+      console.log(new Date().toISOString(), `Client #${info.number} missed heartbeat, terminating`);
+      socket.terminate();
+      continue;
+    }
+    info.alive = false;
+    try {
+      socket.ping();
+    } catch (e) {}
+  }
+}, HEARTBEAT_MS);
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(new Date().toISOString(), `Relay listening on http://127.0.0.1:${PORT} (WS path /bridge)`);

@@ -231,7 +231,9 @@ on screen (`window.html`, one instance per open window):
   window-relative position landed the toast partly *underneath* Vivaldi's
   own toolbar/tab-strip chrome, which silently ate clicks on that portion
   (confirmed live via `document.elementFromPoint` hit-testing at several
-  points across the toast). Background opacity is `TOAST_OPACITY` (a
+  points across the toast). Centered in that viewport rect since 2026-10-21
+  (previously its upper-right corner, which is also where macOS
+  notifications land). Background opacity is `TOAST_OPACITY` (a
   constant at the top, currently `0.6`); auto-dismisses after
   `TOAST_DURATION_MS` (also freely tweakable). Four `variant`s share this
   renderer: `"route"` (default) is interactive — click sends a
@@ -495,7 +497,7 @@ still being in A. Fixed:
   there synchronously; it's a pure `chrome.windows.update(..., {focused:
   true})`. Text changed from `"Moved N tab(s) to X"` to `"Moved N tab(s) to
   X\n\nClick to switch"` to match, and it now gets the same `TOAST_DURATION_MS`
-  (8s) as `"route"` instead of the short informational duration, since the
+  (now 5s, was 8s) as `"route"` instead of the short informational duration, since the
   user may actually need to read and act on it.
 - `window-toast.js`'s `activeTarget` gained a `kind` field (`"route"` vs.
   `"moved-tabs"`) so `jumpToActiveTarget` can send the right follow-up
@@ -1295,6 +1297,44 @@ check should already see it as non-background) — flag to Aaron if a
 spurious toast/jump ever appears right after a redirected new tab. **Still
 needs a real Cmd+T retest** to confirm the cursor actually lands in the
 chat input now.
+
+## Relay robustness (2026-10-16)
+
+**Accessibility permission breaks on every `brew upgrade node`.** The
+relay's `activateWorkspaceViaMenu` (the menu click that assigns a workspace
+to a newly created window) needs macOS Accessibility permission for the
+node binary running `relay/server.js`. Homebrew node is ad-hoc signed, so
+the grant is tied to the versioned Cellar path
+(`/opt/homebrew/Cellar/node/<version>/bin/node`). An upgrade silently
+revokes it. Symptom: any jump or move that needs a new window leaves a
+blank, unassigned window and does nothing else. The relay now logs the
+AppleScript error (and any `ok:false`/timeout result) to
+`~/Library/Logs/vivaldi-workspace-relay.log`, since `curl -s` callers throw
+the response away.
+
+**More than one copy of the injected script can be connected at once.**
+From 2026-08 to 2026-10 the relay log showed a second client connected for
+hours on most active days. The relay used to terminate the old socket on
+every new connection, so two clients kicked each other about once a second
+(the kicked one's retry delay resets on every successful open). That
+produced ~500k log lines and silently dropped any request in flight when a
+socket died. The relay now keeps every client connected, reaps dead ones
+with a 30s ping/pong heartbeat, and routes HTTP requests through
+`pickBrowserSocket`: a non-incognito client first, then the longest-running
+page. Each client sends a `hello` on connect (`incognito`, `startedAt`,
+`href`, its visible windows), which the relay logs.
+
+**The second client is a private window, confirmed live 2026-10-17.**
+Opening a private (incognito) window makes Vivaldi load a second
+`main.html` for the off-the-record profile, with this script in it. The
+relay logged `Client identified: #4 incognito=true ... windows=[private:normal]`
+the moment one opened, and `disconnected` the moment it closed. That copy's
+chrome.* APIs only see private windows, so before this fix, any hotkey
+request that happened to land on it acted on the wrong set of windows.
+`pickBrowserSocket`'s non-incognito preference exists for exactly this.
+Verified end to end the same night: with that fix plus a fresh node
+Accessibility grant, `/move-selected-tabs-to-workspace?workspace=Tech`
+created and assigned a new Tech window and moved the test tab into it.
 
 ## Debugging
 
