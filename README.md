@@ -6,8 +6,9 @@ reassign whatever window is currently focused, hiding tabs you didn't mean
 to touch (see the planning doc's "Rejected approach" section for why that
 ruled out the obvious Keyboard Maestro + built-in-shortcut approach). This
 project is five features that each solve a different piece of "get me to
-the right workspace window without that happening", plus a sixth, related
-but separate per-workspace convenience:
+the right workspace window without that happening", plus two related but
+separate conveniences (a per-workspace new-tab page, and workspace-aware
+recent-tab switching):
 
 - **Feature 1 — auto-jump for externally-opened routed tabs.** A link opened
   from another app (or similar) that Vivaldi's "open websites in workspaces
@@ -48,9 +49,18 @@ but separate per-workspace convenience:
   specific workspaces their own Cmd+T destination — e.g. the "Claude"
   workspace always opening `claude.ai` — instead of Vivaldi's single global
   New Tab Page setting.
+- **Feature 7 — workspace-aware recent-tab switching (Ctrl+J / Ctrl+K).**
+  Step backward and forward through your most recently used tabs across
+  *all* windows and workspaces, like the QuickTabs extension — but it
+  understands workspaces. QuickTabs just activates the tab in whatever
+  window you're in, so a tab from another workspace shows up in the wrong
+  place. Here, each step brings forward the window showing that tab's
+  workspace and activates the tab there, or opens and assigns a new window
+  if that workspace was closed. Keep tapping to go deeper into the list; the
+  tab you stop on becomes the most recent after a short pause.
 
 Features 1 and 2 are two branches of the same underlying detection code and
-share one install step. Features 3, 4, 5 & 6 all reuse that same install
+share one install step. Features 3, 4, 5, 6 & 7 all reuse that same install
 (just different relay endpoints, or in Feature 6's case a source-edited
 constant) — see each one's own section below for setup. All of these can be
 installed independently of each other.
@@ -534,6 +544,47 @@ window; every subsequent Cmd+T in that same window works normally.
 
 ---
 
+## Feature 7: workspace-aware recent-tab switching
+
+Two relay endpoints step through a most-recently-used (MRU) tab list that
+spans every window and workspace:
+
+- `GET http://127.0.0.1:8877/mru-back` — go one tab further back in history.
+- `GET http://127.0.0.1:8877/mru-forward` — go one tab forward again.
+
+Bind them to hotkeys with Keyboard Maestro (limit the macros to Vivaldi),
+e.g. Ctrl+J → `curl -s http://127.0.0.1:8877/mru-back` and Ctrl+K →
+`curl -s http://127.0.0.1:8877/mru-forward`. They have to be external
+hotkeys: keys pressed while a web page has focus never reach scripts
+injected into Vivaldi's UI. If Vivaldi already uses those keys itself,
+unbind or reassign them in Vivaldi's keyboard settings first.
+
+Needs the same install as Features 1 & 2 (`injected/install.sh` + the
+relay). After updating, restart the relay too — it's a separate process
+from Vivaldi:
+`launchctl kickstart -k gui/$(id -u)/com.aaron.vivaldi-workspace-relay`.
+
+**How it behaves**
+
+- Each step focuses the window showing the tab's workspace and activates the
+  tab. If no window shows that workspace, one is created and assigned first.
+- A small toast shows the workspace and tab title you landed on.
+- While you keep tapping, the list stays put. About 1.5 seconds after your
+  last press (`MRU_COMMIT_MS` in `workspace-route-watcher.js`), the tab
+  you're on moves to the front, so Ctrl+J then Ctrl+K toggles back and forth
+  between two tabs, and tapping Ctrl+J repeatedly walks further back.
+- At the ends of the list the endpoint returns `AT_OLDEST` / `AT_NEWEST`.
+
+**Limitations**
+
+- A tab in a workspace that has no window gets recreated in the new window
+  (the same workaround Feature 4 uses for a broken Vivaldi tab move), so it
+  loses its back/forward history and any in-page state.
+- The list lives in memory and starts over when Vivaldi restarts.
+- Private windows are tracked separately and aren't included.
+
+---
+
 ## Uninstalling
 
 Delete the `<script>` tags injected into `main.html`/`window.html`
@@ -542,4 +593,4 @@ easiest is to reinstall/repair Vivaldi, or manually edit those two HTML
 files; this also removes Feature 5's context menu item, since it's
 registered by the same script), `launchctl unload` + remove the LaunchAgent
 plist, remove the extension via `vivaldi://extensions` if installed, and
-remove any Feature 3/4 Keyboard Maestro macros.
+remove any Feature 3/4/7 Keyboard Maestro macros.

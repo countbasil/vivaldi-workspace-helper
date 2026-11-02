@@ -16,6 +16,8 @@
 //        -> 200 with the page's jumpToLastRoutedTab() result otherwise
 //        -> 504 {ok:false, reason:"TIMEOUT"} if the page doesn't reply in time
 //   GET  http://127.0.0.1:<port>/move-selected-tabs-to-workspace?workspace=<name>
+//   GET  http://127.0.0.1:<port>/move-selected-tabs-to-workspace-and-follow?workspace=<name>
+//        (same, but ends up focused on the destination window)
 //        -- moves whatever tab(s) are currently selected in Vivaldi's
 //        focused window to the named workspace. Added as a workaround for a
 //        confirmed Vivaldi bug where its own "Move Active Tab to Workspace"
@@ -34,6 +36,12 @@
 //        response shape as /jump-last-routed, plus
 //        {reason:"NO_RECENT_MOVE"} (nothing moved yet this session) or
 //        {reason:"TARGET_WINDOW_GONE"} (that window was closed since).
+//   GET  http://127.0.0.1:<port>/mru-back, /mru-forward
+//        -- step backward/forward through the most-recently-used tab list
+//        across all windows and workspaces (QuickTabs-style Ctrl+J/Ctrl+K).
+//        Each step focuses the window showing the tab's workspace, creating
+//        and assigning one if needed. {reason:"AT_OLDEST"}/{reason:"AT_NEWEST"}
+//        at the ends of the list. Bind to Keyboard Maestro hotkeys.
 //   GET  http://127.0.0.1:<port>/open-add-rule-dialog
 //        -- opens the "route this domain to a workspace" dialog (Feature 5)
 //        for the active tab in Vivaldi's currently focused window. Same
@@ -192,17 +200,21 @@ function handleJumpLastRouted(res) {
   sendBrowserRequest(res, { type: "jumpLastRouted" });
 }
 
-function handleMoveSelectedTabsToWorkspace(res, workspaceName) {
+function handleMoveSelectedTabsToWorkspace(res, workspaceName, follow = false) {
   if (!workspaceName) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: false, reason: "MISSING_WORKSPACE_PARAM" }));
     return;
   }
-  sendBrowserRequest(res, { type: "moveSelectedTabsToWorkspace", workspaceName });
+  sendBrowserRequest(res, { type: "moveSelectedTabsToWorkspace", workspaceName, follow });
 }
 
 function handleJumpLastMovedTabs(res) {
   sendBrowserRequest(res, { type: "jumpLastMovedTabs" });
+}
+
+function handleMru(res, direction) {
+  sendBrowserRequest(res, { type: direction === "back" ? "mruBack" : "mruForward" });
 }
 
 function handleOpenAddRuleDialog(res) {
@@ -226,8 +238,17 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && parsed.pathname === "/move-selected-tabs-to-workspace") {
     return handleMoveSelectedTabsToWorkspace(res, parsed.searchParams.get("workspace"));
   }
+  if (req.method === "GET" && parsed.pathname === "/move-selected-tabs-to-workspace-and-follow") {
+    return handleMoveSelectedTabsToWorkspace(res, parsed.searchParams.get("workspace"), true);
+  }
   if (req.method === "GET" && parsed.pathname === "/jump-last-moved-tabs") {
     return handleJumpLastMovedTabs(res);
+  }
+  if (req.method === "GET" && parsed.pathname === "/mru-back") {
+    return handleMru(res, "back");
+  }
+  if (req.method === "GET" && parsed.pathname === "/mru-forward") {
+    return handleMru(res, "forward");
   }
   if (req.method === "GET" && parsed.pathname === "/open-add-rule-dialog") {
     return handleOpenAddRuleDialog(res);

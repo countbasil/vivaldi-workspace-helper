@@ -1081,7 +1081,7 @@
   // in-page trigger for this at all -- it exists specifically to be bound to
   // an external hotkey (e.g. Keyboard Maestro) in place of Vivaldi's own
   // broken shortcut.
-  async function moveSelectedTabsToWorkspace(workspaceName) {
+  async function moveSelectedTabsToWorkspace(workspaceName, follow = false) {
     try {
       const ws = findWorkspaceByName(workspaceName);
       if (!ws) return { ok: false, reason: "UNKNOWN_WORKSPACE" };
@@ -1100,13 +1100,16 @@
       // workspace was disorienting for a background move triggered by an
       // external hotkey. The destination is reachable via the toast below
       // (or jumpToLastMovedTabs) instead.
-      const moveResult = await moveTabsToWorkspace(selectedTabs, sourceWin.id, ws.id, ws.name, { focusDestination: false });
+      // follow=true (the "-and-follow" relay endpoint) flips this: end up on
+      // the destination window, like jumpToTab does.
+      const moveResult = await moveTabsToWorkspace(selectedTabs, sourceWin.id, ws.id, ws.name, { focusDestination: follow });
 
       const result = {
         ...moveResult,
         workspaceId: ws.id,
         workspaceName: ws.name,
         workspaceEmoji: ws.emoji,
+        followed: follow,
       };
       lastMovedTabs = { workspaceId: ws.id, workspaceName: ws.name, workspaceEmoji: ws.emoji };
       return result;
@@ -1171,6 +1174,124 @@
   async function jumpToLastMovedTabs() {
     if (!lastMovedTabs) return { ok: false, reason: "NO_RECENT_MOVE" };
     return focusWorkspaceWindow(lastMovedTabs.workspaceId);
+  }
+
+  // ---------- most-recently-used tab traversal (Feature 7) ----------
+  //
+  // Replaces the QuickTabs extension's Ctrl+J / Ctrl+K, which activated a
+  // tab in place even when it belonged to a different workspace. Here every
+  // step goes through jumpToTab, so the window displaying the tab's workspace
+  // is focused (or created and assigned if the workspace has none) before the
+  // tab is activated. Reachable only via the relay (/mru-back, /mru-forward):
+  // keys pressed while a page has focus never reach injected JS.
+  //
+  // mruList is most-recent-first and global across windows. While a
+  // traversal is in progress, activations are NOT recorded (they're our own,
+  // and recording them would reorder the list under the cursor); the
+  // traversal works on a frozen `snapshot`, and MRU_COMMIT_MS after the last
+  // step the tab you landed on moves to the front -- same semantics as
+  // QuickTabs' "release the modifier" commit, which isn't observable from
+  // outside Vivaldi.
+  const MRU_MAX = 100;
+  const MRU_COMMIT_MS = 1500;
+  let mruList = [];
+  // Ids of tabs that have been closed (including the old id of a tab that
+  // recreateTabInWindow replaced). The snapshot isn't edited in place by
+  // onRemoved -- that would shift the cursor's index mid-traversal -- so dead
+  // ids are filtered out at read time instead.
+  const mruDeadIds = new Set();
+  let mruTraversal = null; // { snapshot, cursor, timer }
+  let mruQueue = Promise.resolve();
+
+  function mruRecord(tabId) {
+    if (mruTraversal) return;
+    mruList = [tabId, ...mruList.filter((id) => id !== tabId)].slice(0, MRU_MAX);
+  }
+
+  function mruRecordActiveTabOfWindow(windowId) {
+    if (windowId == null || windowId === chrome.windows.WINDOW_ID_NONE) return;
+    chrome.tabs.query({ windowId, active: true }, (tabs) => {
+      if (chrome.runtime.lastError || !tabs || !tabs[0]) return;
+      mruRecord(tabs[0].id);
+    });
+  }
+
+  function mruMarkDead(tabId) {
+    mruDeadIds.add(tabId);
+    if (mruDeadIds.size > 500) mruDeadIds.delete(mruDeadIds.values().next().value);
+    mruList = mruList.filter((id) => id !== tabId);
+  }
+
+  function mruCommit() {
+    const t = mruTraversal;
+    if (!t) return;
+    mruTraversal = null;
+    const landed = t.snapshot[t.cursor];
+    const rest = t.snapshot.filter((id) => id !== landed && !mruDeadIds.has(id));
+    mruList = [landed, ...rest].slice(0, MRU_MAX);
+  }
+
+  async function mruStep(direction) {
+    try {
+      if (!mruTraversal) {
+        // Make sure index 0 really is the tab being looked at right now.
+        const win = await new Promise((resolve) => chrome.windows.getLastFocused({}, resolve));
+        if (win) {
+          const [active] = await new Promise((resolve) => chrome.tabs.query({ windowId: win.id, active: true }, resolve));
+          if (active) mruRecord(active.id);
+        }
+        mruTraversal = { snapshot: mruList.filter((id) => !mruDeadIds.has(id)), cursor: 0, timer: null };
+      }
+      const t = mruTraversal;
+      clearTimeout(t.timer);
+
+      const delta = direction === "back" ? 1 : -1;
+      let i = t.cursor + delta;
+      let tab = null;
+      while (i >= 0 && i < t.snapshot.length) {
+        tab = mruDeadIds.has(t.snapshot[i]) ? null : await getTab(t.snapshot[i]);
+        if (tab) break;
+        i += delta;
+      }
+      if (!tab) return { ok: false, reason: delta > 0 ? "AT_OLDEST" : "AT_NEWEST" };
+
+      const ws = resolveWorkspaceForTab(tab);
+      const result = await jumpToTab(tab.id, ws ? ws.id : null, ws ? ws.name : null);
+      if (!result.ok) return result;
+      await chrome.windows.update(result.windowId, { focused: true });
+
+      // jumpToTab may have recreated the tab under a new id.
+      t.snapshot[i] = result.tabId;
+      t.cursor = i;
+
+      const shownWs = ws || (() => {
+        const id = findWorkspaceIdForWindow(result.windowId);
+        const w = id != null && workspaceStore.getWorkspaceById(id);
+        return w ? { id, name: w.name, emoji: w.emoji } : null;
+      })();
+      chrome.runtime.sendMessage({
+        type: "vwh-show-toast",
+        variant: "mru",
+        displayWindowId: result.windowId,
+        workspaceName: shownWs && shownWs.name,
+        workspaceEmoji: shownWs && shownWs.emoji,
+        tabTitle: (tab.title || tab.url || "").slice(0, 80),
+        mruPosition: i,
+      });
+      return { ok: true, windowId: result.windowId, tabId: result.tabId, position: i, created: result.created };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    } finally {
+      if (mruTraversal) mruTraversal.timer = setTimeout(mruCommit, MRU_COMMIT_MS);
+    }
+  }
+
+  // Steps run strictly one at a time: a fast double-press can otherwise
+  // overlap with a jump that's still creating a window.
+  function mruNavigate(direction) {
+    const p = mruQueue.then(() => mruStep(direction));
+    mruQueue = p.catch(() => {});
+    return p;
   }
 
   // ---------- add-a-routing-rule dialog (Feature 5) ----------
@@ -1411,8 +1532,9 @@
         return;
       }
       if (msg.type === "moveSelectedTabsToWorkspace") {
-        const result = await moveSelectedTabsToWorkspace(msg.workspaceName);
-        if (result.ok) showMovedTabsToast(result);
+        const result = await moveSelectedTabsToWorkspace(msg.workspaceName, !!msg.follow);
+        // The "click to switch" toast is pointless when we already followed.
+        if (result.ok && !result.followed) showMovedTabsToast(result);
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }
@@ -1423,6 +1545,11 @@
       }
       if (msg.type === "openAddRuleDialog") {
         const result = await openAddRuleDialogForFocusedWindow();
+        socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
+        return;
+      }
+      if (msg.type === "mruBack" || msg.type === "mruForward") {
+        const result = await mruNavigate(msg.type === "mruBack" ? "back" : "forward");
         socket.send(JSON.stringify(Object.assign({ requestId: msg.requestId }, result)));
         return;
       }
@@ -1614,6 +1741,23 @@
       }
     });
 
+    // MRU tracking (Feature 7). A window activation without a tab change
+    // fires onFocusChanged only; a tab change in the focused window fires
+    // onActivated only -- both are needed.
+    chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+      chrome.windows.get(windowId, (w) => {
+        if (!chrome.runtime.lastError && w && w.focused) mruRecord(tabId);
+      });
+    });
+    chrome.windows.onFocusChanged.addListener(mruRecordActiveTabOfWindow);
+    chrome.tabs.onRemoved.addListener(mruMarkDead);
+    chrome.tabs.query({ active: true }, (tabs) => {
+      for (const t of tabs || []) mruRecord(t.id);
+      chrome.windows.getLastFocused({}, (w) => {
+        if (!chrome.runtime.lastError && w) mruRecordActiveTabOfWindow(w.id);
+      });
+    });
+
     refreshFocusedWorkspaceBaseline();
     workspaceStore.addListener(onWorkspaceStoreChanged);
 
@@ -1634,6 +1778,10 @@
       addWorkspaceRule,
       openAddRuleDialogForFocusedWindow,
       jumpToWorkspace,
+      mruNavigate,
+      get mruList() {
+        return mruList;
+      },
       NEW_TAB_OVERRIDES,
       injectFocusSelector,
     };

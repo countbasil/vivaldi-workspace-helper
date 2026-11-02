@@ -44,6 +44,50 @@
   let activeTarget = null;
   let toastKeydownHandler = null;
 
+  // Where Aaron last dropped a dragged toast, as the gap between the toast's
+  // upper-right corner and the content viewport's upper-right corner. The
+  // default (nothing saved yet) is a small margin from that corner. Kept in
+  // chrome.storage.local so it survives restarts and is shared by every
+  // window's instance of this script; the onChanged listener keeps this
+  // cached copy current because showToast has to position synchronously.
+  const TOAST_POS_KEY = "vwhToastPos";
+  const DEFAULT_TOAST_GAP = { right: 16, top: 16 };
+  let savedToastGap = null; // { right, top } | null
+
+  function isValidGap(o) {
+    return !!o && Number.isFinite(o.right) && Number.isFinite(o.top);
+  }
+
+  try {
+    chrome.storage.local.get([TOAST_POS_KEY], (stored) => {
+      if (isValidGap(stored && stored[TOAST_POS_KEY])) savedToastGap = stored[TOAST_POS_KEY];
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes[TOAST_POS_KEY]) return;
+      const next = changes[TOAST_POS_KEY].newValue;
+      savedToastGap = isValidGap(next) ? next : null;
+    });
+  } catch (err) {
+    console.warn("[VWH-toast] toast position storage unavailable", err);
+  }
+
+  // Places the (already attached, so measurable) toast at the saved/default
+  // gap from the viewport's upper-right corner, then pulls it back inside the
+  // viewport on any side it would overflow. If the toast is wider than the
+  // viewport, the left edge wins so the start of the text stays visible.
+  function positionToast(el) {
+    const vp = getContentViewportRect();
+    const gap = savedToastGap || DEFAULT_TOAST_GAP;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const maxLeft = vp.left + vp.width - w;
+    const maxTop = vp.top + vp.height - h;
+    const left = Math.max(vp.left, Math.min(maxLeft, vp.left + vp.width - gap.right - w));
+    const top = Math.max(vp.top, Math.min(maxTop, vp.top + gap.top));
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+  }
+
   function jumpToActiveTarget() {
     if (!activeTarget) return;
     if (activeTarget.kind === "moved-tabs") {
@@ -73,10 +117,10 @@
   // window-relative toast, silently eating clicks meant for it (only the
   // portion of the toast actually over the content viewport was
   // clickable). Anchoring to the content viewport's own rect instead fixes
-  // this regardless of tab-strip/panel configuration. The toast is centered
-  // in that rect (changed 2026-10-21 from its upper-right corner, per
-  // Aaron's request -- same reason as the add-rule dialog below: top-right
-  // is where macOS notifications land too). Falls back to the whole window
+  // this regardless of tab-strip/panel configuration. The toast sits at its
+  // saved (or default) gap from that rect's upper-right corner, clamped
+  // inside it (see positionToast; moved back to the upper right 2026-10-23,
+  // per Aaron, after a brief stint centered). Falls back to the whole window
   // if no viewport is found.
   function getContentViewportRect() {
     const views = document.querySelectorAll(".webpageview, webview");
@@ -137,17 +181,12 @@
           : { kind: "moved-tabs", workspaceId: message.workspaceId, workspaceName: message.workspaceName };
     }
 
-    const viewport = getContentViewportRect();
-    const centerX = Math.round(viewport.left + viewport.width / 2);
-    const centerY = Math.round(viewport.top + viewport.height / 2);
-
     const el = document.createElement("div");
     el.id = "vwh-toast";
     el.style.cssText = [
       "position: fixed",
-      `top: ${centerY}px`,
-      `left: ${centerX}px`,
-      "transform: translate(-50%, -50%)",
+      "top: 0",
+      "left: 0",
       "z-index: 2147483647",
       `background: rgba(32, 32, 36, ${TOAST_OPACITY})`,
       "color: #fff",
@@ -170,6 +209,8 @@
       el.textContent = `Raised window with ${emoji} ${workspaceLabel}`;
     } else if (variant === "created-window") {
       el.textContent = `Created window for ${emoji} ${workspaceLabel}`;
+    } else if (variant === "mru") {
+      el.textContent = `${emoji} ${workspaceLabel}\n${message.tabTitle || ""}`;
     } else if (variant === "moved-tabs") {
       const n = message.tabCount || 1;
       el.textContent = `Moved ${n} tab${n === 1 ? "" : "s"} to ${emoji} ${workspaceLabel}\n\nClick or press Tab to switch`;
@@ -216,8 +257,6 @@
           if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return; // still a click
           dragging = true;
           clearTimeout(dismissTimer);
-          // Swap the centering transform for explicit pixel coordinates.
-          el.style.transform = "none";
         }
         el.style.left = `${rect.left + dx}px`;
         el.style.top = `${rect.top + dy}px`;
@@ -229,6 +268,18 @@
         if (dragging) {
           justDragged = true;
           dismissTimer = setTimeout(dismissToast, durationMs);
+          // Remember the drop point for future toasts (see TOAST_POS_KEY).
+          const vp = getContentViewportRect();
+          const r = el.getBoundingClientRect();
+          savedToastGap = {
+            right: Math.round(vp.left + vp.width - r.right),
+            top: Math.round(r.top - vp.top),
+          };
+          try {
+            chrome.storage.local.set({ [TOAST_POS_KEY]: savedToastGap });
+          } catch (err) {
+            console.warn("[VWH-toast] couldn't save toast position", err);
+          }
         }
       };
       el.addEventListener("pointermove", onMove);
@@ -264,6 +315,7 @@
     el.appendChild(closeBtn);
 
     document.body.appendChild(el);
+    positionToast(el);
     toastEl = el;
 
     // Keyboard shortcut for this toast -- originally scoped to "moved-tabs"

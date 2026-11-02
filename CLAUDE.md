@@ -1298,6 +1298,24 @@ spurious toast/jump ever appears right after a redirected new tab. **Still
 needs a real Cmd+T retest** to confirm the cursor actually lands in the
 chat input now.
 
+## Seventh feature: workspace-aware MRU tab traversal (2026-10-30, UNCONFIRMED until live-tested)
+
+Replaces QuickTabs' Ctrl+J/Ctrl+K, which activated tabs in place even when
+they belonged to another workspace. `mruNavigate("back"|"forward")`
+(`injected/workspace-route-watcher.js`) walks a global most-recently-used
+list fed by `tabs.onActivated`, `windows.onFocusChanged` and
+`tabs.onRemoved`. Each step calls `jumpToTab` with the tab's own
+`vivExtData` workspace, so the window showing that workspace is focused, or
+created and assigned if there is none. Reachable only via the relay:
+`GET /mru-back` and `GET /mru-forward`, bound to Keyboard Maestro hotkeys
+scoped to Vivaldi (keys pressed with a page focused never reach injected
+JS). Activations are not recorded while a traversal is open; the landed tab
+moves to the front `MRU_COMMIT_MS` (1.5s) after the last step. Steps are
+serialized through `mruQueue`. A tab in a windowless workspace is recreated
+by `jumpToTab`, so it loses history and gets a new id (the snapshot is
+remapped). The list is in memory only and resets on restart. A new `"mru"`
+informational toast variant in `window-toast.js` shows workspace + title.
+
 ## Relay robustness (2026-10-16)
 
 **Accessibility permission breaks on every `brew upgrade node`.** The
